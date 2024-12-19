@@ -1,0 +1,25 @@
+import pymavlink.dialects.v20.ardupilotmega as mavlink2_0
+ 
+def get_cmd_ln(mav,rssi,qlt,pkts,ch,freq):
+    
+    command_ln = mav.command_long_encode(
+            target_system=255,        
+            target_component=100,     
+            command=1058,           
+            confirmation=0,         
+            param1=rssi,               
+            param2=qlt,              
+            param3=pkts,               
+            param4=ch,               
+            param5=freq,               
+            param6=0,               
+            param7=0                
+        )
+    return command_ln
+mav = mavlink2_0.MAVLink(None)
+print(mav)
+command_long = get_cmd_ln(mav,-63,100,230,140,5700)
+
+command_long_msg = command_long.pack(mav)
+print (command_long)
+print (command_long_msg)
