@@ -1,62 +1,57 @@
+#!/usr/bin/python3
 import socket
 import struct
 import time
 import click
 import zfec
 
+
+def fec_encode(d_k,d_m,bloks: list) -> list:
+    encoder = zfec.Encoder(d_k, d_m)
+    try:
+        encoded_blocks = encoder.encode(bloks)
+    except Exception as e:
+        encoded_blocks = []            
+    return encoded_blocks    
+
+def blocks_encoder(blocks: list) -> list:
+    encoded_blocks = []
+    max_block_size = 0
+    for block in blocks:
+        block_size = len(block)
+        if block_size > max_block_size:
+            max_block_size = block_size
+    for block in blocks:
+        block_size = len(block)
+        if block_size < max_block_size:
+            ext_block = b"\xFF"*(max_block_size-block_size)
+            encoded_block = struct.pack("!I"+str(block_size)+"s"+ str(len(ext_block))+"s", block_size, block, ext_block)
+        else:
+            encoded_block = struct.pack("!I"+str(block_size)+"s", block_size, block)
+        encoded_blocks.append(encoded_block)
+    return encoded_blocks
+
+def ring_blocks_encoder(rb_id,e_k,e_m, blocks: list) -> list:
+    encoded_blocks = []
+    block_number = 0
+    for block in blocks:
+        block_size = len(block)
+        encoded_block = struct.pack("!IIII"+str(block_size)+"s",rb_id, block_number, e_k, e_m, block)
+        encoded_blocks.append(encoded_block)
+        block_number+=1
+    return encoded_blocks
+
 @click.command()
 @click.option('--mpkts', default=2048, help='udp max pkt size def: 2048')
-@click.option('--ip_rx', default='127.0.0.1', help='ip of sorce stream def: 127.0.0.1')
-@click.option('--port_rx', default=5600, help='port of source stream def: 5700')
+@click.option('--ip_rx', default='0.0.0.0', help='ip of sorce stream def: 0.0.0.0')
+@click.option('--port_rx', default=7600, help='port of source stream def: 7600')
 @click.option('--ip_tx', default='127.0.0.1', help='ip of destination host def: 127.0.0.1')
-@click.option('--port_tx', default=5680, help='first port of destination hosts def: 5680')
-@click.option('--k', default=24, help='fec k param (min fec blocks number to be recoverd) def: 24')
-@click.option('--m', default=36, help='fec m param (fec bloks number of fec ring) def: 36')
+@click.option('--port_tx', default=7700, help='port of destination hosts def: 7700')
+@click.option('--k', default=3, help='fec k param (min fec blocks number to be recoverd) def: 3')
+@click.option('--m', default=6, help='fec m param (fec bloks number of fec ring) def: 6')
 
 def main(mpkts,ip_rx,port_rx,ip_tx,port_tx,k,m):
 
-    def fec_encode(d_k,d_m,bloks: list) -> list:
-        encoder = zfec.Encoder(d_k, d_m)
-        try:
-            encoded_blocks = encoder.encode(bloks)
-        except Exception as e:
-            encoded_blocks = []            
-        return encoded_blocks    
-
-    def blocks_encoder(blocks: list) -> list:
-        encoded_blocks = []
-        max_block_size = 0
-        for block in blocks:
-            block_size = len(block)
-            if block_size > max_block_size:
-                max_block_size = block_size
-        for block in blocks:
-            block_size = len(block)
-            if block_size < max_block_size:
-                ext_block = b'ff'*(max_block_size-block_size)
-                encoded_block = struct.pack("!I"+str(block_size)+"s"+ str(len(ext_block))+"s", block_size, block, ext_block)
-            else:
-                encoded_block = struct.pack("!I"+str(block_size)+"s", block_size, block)
-            encoded_blocks.append(encoded_block)
-        return encoded_blocks
-
-    def blocks_decoder(blocks: list) -> list:
-        decoded_blocks = []
-        for block in blocks:
-            cblock_size = len(block)
-            block_size, data= struct.unpack("!I"+str((cblock_size - 4))+"s", block)
-            decoded_block, add_block = struct.unpack(str(block_size)+"s"+str(len(data) - block_size)+"s", data)
-            decoded_blocks.append(decoded_block)
-        return decoded_blocks
-
-    def fec_decode(d_k,d_m,bloks: list,b_indexes: list) -> list:
-        decoder = zfec.Decoder(d_k, d_m)
-        try:
-            decoded_blocks = decoder.decode(bloks,b_indexes)
-        except Exception as e:
-            decoded_blocks = []            
-        return decoded_blocks    
-    
     #--init--
     sock_tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
@@ -65,16 +60,40 @@ def main(mpkts,ip_rx,port_rx,ip_tx,port_tx,k,m):
 
     print("udp_fec_tx started...")
     print(f"rx: {ip_rx} : {port_rx}")
-    print(f"rx: {ip_tx} : {port_tx}")
+    print(f"tx: {ip_tx} : {port_tx}")
     print(f"k: {k}")
     print(f"m: {m}")
+    
+    # ====== TX ======
+    tx_list = []
+    fec_ring_id = 0
 
     while True:
+        fec_ring_id +=1 
+        fec_ring_data = []
 
-        data, addr = sock_rx.recvfrom(mpkts)
-        PACKET_SIZE = len(data)
+        for i in range(k):
+            data, addr = sock_rx.recvfrom(mpkts)
+            PACKET_SIZE = len(data)
+            fec_ring_data.append(data)
 
-        sock_tx.sendto(data,(ip_tx, port_tx))
+        #print("\n","fec_ring_data: ",fec_ring_data,'\n')
+
+
+        encoded_blocks = blocks_encoder(fec_ring_data)
+        #print ('encoded blocks: ',encoded_blocks)
+        #for encoded_block in encoded_blocks:
+        #    print(encoded_block,' : ', len(encoded_block))
+
+        encoded_fragments = fec_encode(k,m,encoded_blocks)
+        #print('\nfec encoded blocks: ', encoded_fragments)
+
+        ring_tx_blocks = ring_blocks_encoder(fec_ring_id,k,m,encoded_fragments)
+        #print ("ring_tx: ", ring_tx_blocks)
+
+        for tx_block in ring_tx_blocks:
+            sock_tx.sendto(tx_block,(ip_tx, port_tx))
+            #print("tx block: ", tx_block)
 
 
 if __name__ == '__main__':
