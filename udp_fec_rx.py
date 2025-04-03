@@ -1,7 +1,6 @@
 #!/usr/bin/python3
 import socket
 import struct
-import time
 import click
 import zfec
 
@@ -47,7 +46,6 @@ def main(mpkts,ip_rx,port_rx,ip_tx,port_tx):
     
     # ====== RX ======
 
-    encoded_blocks = []
     encoded_fragments = []
     indexes = []
     ring_rx_block, addr = sock_rx.recvfrom(mpkts)
@@ -84,7 +82,6 @@ def main(mpkts,ip_rx,port_rx,ip_tx,port_tx):
                     sock_tx.sendto(tx_block,(ip_tx, port_tx))
                     #print(tx_block)
 
-
             ring_rx_block, addr = sock_rx.recvfrom(mpkts)
         
             rx_ring_block_size = len(ring_rx_block)
@@ -94,12 +91,10 @@ def main(mpkts,ip_rx,port_rx,ip_tx,port_tx):
             blocks_counter += 1
 
         #preparing for next rx_ring
-        encoded_blocks = []
         encoded_fragments = []
         indexes = []
         rb_id = b_rb_id
         blocks_counter = 0
-
 
 if __name__ == '__main__':
     main()
