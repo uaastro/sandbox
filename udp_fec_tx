@@ -3,6 +3,7 @@ import socket
 import struct
 import click
 import zfec
+import time
 
 
 def fec_encode(d_k,d_m,bloks: list) -> list:
@@ -13,7 +14,7 @@ def fec_encode(d_k,d_m,bloks: list) -> list:
         encoded_blocks = []            
     return encoded_blocks    
 
-def blocks_encoder(blocks: list) -> list:
+def blocks_encoder(blocks: list, pkt_dl_list: list) -> list:
     encoded_blocks = []
     max_block_size = 0
     for block in blocks:
@@ -48,8 +49,11 @@ def ring_blocks_encoder(rb_id,e_k,e_m, blocks: list) -> list:
 @click.option('--port_tx', default=7700, help='port of destination hosts def: 7700')
 @click.option('--k', default=3, help='fec k param (min fec blocks number to be recoverd) def: 3')
 @click.option('--m', default=6, help='fec m param (fec bloks number of fec ring) def: 6')
+@click.option('--mode', default=0, help='default mode 0 (no pkt delay) mode 1 with pkt delay')
+@click.option('--maxpktdl', default=20, help='max pkt delay default 20 ms')
 
-def main(mpkts,ip_rx,port_rx,ip_tx,port_tx,k,m):
+
+def main(mpkts,ip_rx,port_rx,ip_tx,port_tx,k,m,mode,mxpktdl):
 
     #--init--
     sock_tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -62,24 +66,36 @@ def main(mpkts,ip_rx,port_rx,ip_tx,port_tx,k,m):
     print(f"tx: {ip_tx} : {port_tx}")
     print(f"k: {k}")
     print(f"m: {m}")
+    print(f"mode: {mode}")
+    print(f"max pkt delay: {mxpktdl}")
     
     # ====== TX ======
-    tx_list = []
+    #tx_list = []
     fec_ring_id = 0
+    last_pkt_time_stmp = time.time()
 
     while True:
         fec_ring_id +=1 
         fec_ring_data = []
+        pkt_delay_list = []
 
         for i in range(k):
             data, addr = sock_rx.recvfrom(mpkts)
+            current_pkt_time_stmp = time.time()
+            if (current_pkt_time_stmp - last_pkt_time_stmp) <= (mxpktdl / 1000):
+                pkt_dl = current_pkt_time_stmp - last_pkt_time_stmp
+                print (pkt_dl)
+            else:
+                pkt_dl = 0
+                print (pkt_dl)
+            pkt_delay_list.append(pkt_dl)    
             PACKET_SIZE = len(data)
             fec_ring_data.append(data)
 
         #print("\n","fec_ring_data: ",fec_ring_data,'\n')
 
 
-        encoded_blocks = blocks_encoder(fec_ring_data)
+        encoded_blocks = blocks_encoder(fec_ring_data, pkt_delay_list)
         #print ('encoded blocks: ',encoded_blocks)
         #for encoded_block in encoded_blocks:
         #    print(encoded_block,' : ', len(encoded_block))
