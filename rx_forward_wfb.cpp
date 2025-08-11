@@ -1,9 +1,7 @@
 // rx_forward_wfb.cpp — RX (monitor) -> UDP 127.0.0.1:5800
-// Использует ваш стек: #include "wifibroadcast.hpp"
-// Собирает статистику по антеннам (RSSI/NOISE/SNR) по схеме из rx.cpp
+// Использует ваш стек (wifibroadcast.hpp) и поведение rx.cpp для радиотап/цепочек.
 // Сборка: g++ -O2 -Wall -std=c++17 -o rx_forward_wfb rx_forward_wfb.cpp -lpcap
 
-#define _GNU_SOURCE
 #include <pcap/pcap.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
@@ -14,7 +12,7 @@
 #include <cstring>
 #include <climits>
 #include <string>
-#include "wifibroadcast.hpp"   // ваш заголовок
+#include "wifibroadcast.hpp"   // содержит RX_ANT_MAX и константы Radiotap
 
 #ifdef __linux__
   #include <endian.h>
@@ -36,8 +34,6 @@ static const char* IFACE   = "wlx00c0cab8318b";
 static const char* DEST_IP = "127.0.0.1";
 static const int   DEST_PORT = 5800;
 
-enum { RX_ANT_MAX = 4 };
-
 #pragma pack(push,1)
 struct dot11_hdr {
   uint16_t frame_control;
@@ -49,10 +45,10 @@ struct dot11_hdr {
 };
 #pragma pack(pop)
 
+/* ---------------- utils ---------------- */
 static void mac_to_str(const uint8_t m[6], char* out, size_t n) {
   snprintf(out, n, "%02x:%02x:%02x:%02x:%02x:%02x", m[0],m[1],m[2],m[3],m[4],m[5]);
 }
-
 static void hexdump(const uint8_t* data, size_t len) {
   for (size_t i=0; i<len; i+=16) {
     fprintf(stderr, "%04zx: ", i);
@@ -68,9 +64,7 @@ static void hexdump(const uint8_t* data, size_t len) {
   }
 }
 
-/* ---------- Radiotap parser (выравнивание + present chain) ---------- */
-// Требуемые индексы полей соответствуют вашим дефайнам в wifibroadcast.hpp
-// (IEEE80211_RADIOTAP_*)
+/* ---------- Radiotap parser (present-chain + alignment) ---------- */
 #ifndef IEEE80211_RADIOTAP_TSFT
   #define IEEE80211_RADIOTAP_TSFT            0
   #define IEEE80211_RADIOTAP_FLAGS           1
@@ -91,29 +85,30 @@ static void hexdump(const uint8_t* data, size_t len) {
   #define IEEE80211_RADIOTAP_MCS            19
 #endif
 
-// Radiotap header
 #pragma pack(push,1)
 struct rt_hdr_min {
   uint8_t  it_version;
   uint8_t  it_pad;
   uint16_t it_len;
-  uint32_t it_present; // может быть цепочка (EXT=bit31)
+  uint32_t it_present; // может продолжаться через EXT (бит 31)
 };
 #pragma pack(pop)
 
 static inline size_t align_for_field(uint8_t field_idx, size_t off) {
-  // выравнивания по спецификации radiotap
   size_t align = 1;
   switch (field_idx) {
-    case IEEE80211_RADIOTAP_TSFT: align=8; break;
-    case IEEE80211_RADIOTAP_CHANNEL: align=2; break;
-    case IEEE80211_RADIOTAP_FHSS: align=2; break;
-    case IEEE80211_RADIOTAP_LOCK_QUALITY: align=2; break;
-    case IEEE80211_RADIOTAP_TX_ATTENUATION: align=2; break;
-    case IEEE80211_RADIOTAP_DB_TX_ATTENUATION: align=2; break;
-    case IEEE80211_RADIOTAP_RX_FLAGS: align=2; break;
-    case IEEE80211_RADIOTAP_TX_FLAGS: align=2; break;
-    default: align=1; break;
+    case IEEE80211_RADIOTAP_TSFT:
+      align = 8; break;
+    case IEEE80211_RADIOTAP_CHANNEL:
+    case IEEE80211_RADIOTAP_FHSS:
+    case IEEE80211_RADIOTAP_LOCK_QUALITY:
+    case IEEE80211_RADIOTAP_TX_ATTENUATION:
+    case IEEE80211_RADIOTAP_DB_TX_ATTENUATION:
+    case IEEE80211_RADIOTAP_RX_FLAGS:
+    case IEEE80211_RADIOTAP_TX_FLAGS:
+      align = 2; break;
+    default:
+      align = 1; break;
   }
   size_t rem = off % align;
   if (rem) off += (align - rem);
@@ -138,13 +133,13 @@ static inline size_t size_of_field(uint8_t field_idx) {
     case IEEE80211_RADIOTAP_RX_FLAGS: return 2;
     case IEEE80211_RADIOTAP_TX_FLAGS: return 2;
     case IEEE80211_RADIOTAP_MCS: return 3;
-    default: return 0; // неизвестные пропустим нулём — сдвиг не делаем
+    default: return 0;
   }
 }
 
 struct RtStats {
   uint16_t rt_len{0};
-  uint8_t  flags{0};           // radiotap Flags (бит 0x10 = FCS, 0x20 = DATAPAD)
+  uint8_t  flags{0};              // radiotap Flags (0x10=FCS, 0x20=DATAPAD)
   uint8_t  antenna[RX_ANT_MAX];
   int8_t   rssi[RX_ANT_MAX];
   int8_t   noise[RX_ANT_MAX];
@@ -158,13 +153,12 @@ static bool parse_radiotap_rxcpp_like(const uint8_t* p, size_t caplen, RtStats& 
   uint16_t it_len = rh->it_len;
   if (it_len > caplen || it_len < sizeof(rt_hdr_min)) return false;
 
-  // init
   rs.rt_len = it_len;
   rs.flags = 0;
   rs.chains = 0;
   for (int i=0;i<RX_ANT_MAX;i++){ rs.antenna[i]=0xff; rs.rssi[i]=SCHAR_MIN; rs.noise[i]=SCHAR_MAX; }
 
-  // собрать present chain
+  // present chain
   uint32_t presents[8]; int np=0;
   size_t poff = offsetof(rt_hdr_min, it_present);
   do {
@@ -174,13 +168,12 @@ static bool parse_radiotap_rxcpp_like(const uint8_t* p, size_t caplen, RtStats& 
     poff += 4;
   } while (np < 8 && (presents[np-1] & 0x80000000u));
 
-  // начало полей
   size_t off = poff;
   int ant_idx = 0;
 
   for (int wi=0; wi<np; ++wi) {
     uint32_t pres = presents[wi];
-    for (uint8_t f = 0; f < 32; ++f) {
+    for (uint8_t f=0; f<32; ++f) {
       if (!(pres & (1u<<f))) continue;
       off = align_for_field(f, off);
       size_t sz = size_of_field(f);
@@ -201,7 +194,7 @@ static bool parse_radiotap_rxcpp_like(const uint8_t* p, size_t caplen, RtStats& 
         case IEEE80211_RADIOTAP_ANTENNA:
           if (ant_idx < RX_ANT_MAX) {
             rs.antenna[ant_idx] = *field;
-            ant_idx++; // переход к следующей цепочке — как в rx.cpp
+            ant_idx++; // как в rx.cpp — переход к следующей цепочке
           }
           break;
         default:
@@ -256,10 +249,12 @@ int main() {
     if (type != 2) continue; // только Data
 
     size_t hdr_len = sizeof(dot11_hdr);
-    int qos = (subtype & 0x08) ? 1 : 0; if (qos) { if (dlen < hdr_len + 2) continue; hdr_len += 2; }
-    int order = (fc & 0x8000) ? 1 : 0; if (order) { if (dlen < hdr_len + 4) continue; hdr_len += 4; }
+    int qos = (subtype & 0x08) ? 1 : 0;
+    if (qos) { if (dlen < hdr_len + 2) continue; hdr_len += 2; }
+    int order = (fc & 0x8000) ? 1 : 0;
+    if (order) { if (dlen < hdr_len + 4) continue; hdr_len += 4; }
 
-    // DATAPAD (0x20) — если нужно, выровнять длину заголовка до /4
+    // DATAPAD (0x20) — выровнять заголовок до /4
     if (rs.flags & 0x20) {
       size_t aligned = (hdr_len + 3u) & ~3u;
       if (aligned > dlen) continue;
@@ -269,7 +264,7 @@ int main() {
     const uint8_t* payload = dot11 + hdr_len;
     size_t payload_len = dlen - hdr_len;
 
-    // FCS: если включён (0x10), отрезаем 4 байта
+    // FCS (0x10) — отрезать 4 байта
     if ((rs.flags & 0x10) && payload_len >= 4) payload_len -= 4;
     if (payload_len == 0) continue;
 
@@ -279,25 +274,33 @@ int main() {
     fprintf(stderr, "[RX] seq=%u from=%s payload_len=%zu flags=0x%02x\n",
             seq, mac2, payload_len, rs.flags);
 
-    // печатаем цепочки: RSSI/NOISE/SNR
+    // печать per‑chain: RSSI / NOISE / SNR=rssi-noise (если noise известен)
     for (int i=0;i<rs.chains && i<RX_ANT_MAX; ++i) {
       const int8_t r = rs.rssi[i];
       const int8_t n = rs.noise[i];
       bool noise_ok = (n != SCHAR_MAX);
       int snr = noise_ok ? (int)r - (int)n : 0;
       if (rs.antenna[i] != 0xff || r != SCHAR_MIN || n != SCHAR_MAX) {
-        fprintf(stderr, "   ant[%d]=%u  rssi=%d dBm  noise=%s  snr=%d dB\n",
-                i, (unsigned)rs.antenna[i], (int)r,
-                noise_ok ? std::to_string((int)n).c_str() : "NA",
-                snr);
+        if (noise_ok)
+          fprintf(stderr, "   ant[%d]=%u  rssi=%d dBm  noise=%d dBm  snr=%d dB\n",
+                  i, (unsigned)rs.antenna[i], (int)r, (int)n, snr);
+        else
+          fprintf(stderr, "   ant[%d]=%u  rssi=%d dBm  noise=NA  snr=0 dB\n",
+                  i, (unsigned)rs.antenna[i], (int)r);
       }
     }
 
     hexdump(payload, payload_len);
 
     // UDP forward
-    ssize_t sent = sendto(us, payload, payload_len, 0, (sockaddr*)&dst, sizeof(dst));
-    fprintf(stderr, "[RX] UDP-out len=%zd\n", sent);
+    int us = socket(AF_INET, SOCK_DGRAM, 0);
+    if (us >= 0) {
+      sockaddr_in dst{}; dst.sin_family=AF_INET; dst.sin_port=htons(DEST_PORT);
+      inet_aton(DEST_IP, &dst.sin_addr);
+      ssize_t sent = sendto(us, payload, payload_len, 0, (sockaddr*)&dst, sizeof(dst));
+      fprintf(stderr, "[RX] UDP-out len=%zd\n", sent);
+      close(us);
+    }
   }
 
   return 0;
