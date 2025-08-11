@@ -1,30 +1,11 @@
 // udp_inject_cli.c — приём UDP и инжекция в эфир через указанный WLAN-интерфейс (monitor mode).
-// CLI с дефолтами:
-//   --ip 0.0.0.0
-//   --port 5600
-//   --mcs_idx 0
-//   --gi short (long|short)
-//   --bw 20 (20|40)
-//   --ldpc 1
-//   --stbc 1
-//   --group_id 0
-//   --tx_id 0
-//   --link_id 0
-//   --radio_port 0
-//
-// Позиционный обязательный параметр: <wlan_iface>
+// Печать диагностик: длина входного UDP и размеры инжектируемого кадра.
 //
 // Сборка: gcc -O2 -Wall -o udp_inject_cli udp_inject_cli.c -lpcap
-// Пример:
-//   sudo ./udp_inject_cli --ip 127.0.0.1 --port 5600 --mcs_idx 0 --gi short --bw 20 --ldpc 1 --stbc 1 
-//                         --group_id 1 --tx_id 1 --link_id 1 --radio_port 5 wlx00c0cab6e6f4
-//
-// Важно: интерфейс заранее перевести в monitor mode и выставить канал (iw dev <iface> set channel ...)
 
 #define _GNU_SOURCE
 #include <pcap/pcap.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
 #include <signal.h>
@@ -34,6 +15,7 @@
 #include <sys/socket.h>
 #include <getopt.h>
 #include <ctype.h>
+#include <stdlib.h>
 
 #ifdef __linux__
   #include <endian.h>
@@ -76,7 +58,7 @@ struct __attribute__((__packed__)) rt_hdr {
   uint8_t  it_pad;
   uint16_t it_len;
   uint32_t it_present;
-  uint16_t tx_flags;   // ВСЕГДА: NOACK|NOSEQ|FIXED RATE
+  uint16_t tx_flags;   // NOACK|NOSEQ|FIXED RATE|(опц.)NOAGG
   uint8_t  mcs_known;
   uint8_t  mcs_flags;
   uint8_t  mcs_index;
@@ -103,7 +85,7 @@ static uint8_t mcs_flags_from_args(int gi_short, int bw40, int ldpc, int stbc) {
   if (bw40) f |= 1; // 0=20,1=40
   if (gi_short) f |= MCS_FLAGS_SGI;
   if (ldpc)     f |= MCS_FLAGS_LDPC;
-  if (stbc < 0) stbc = 0; 
+  if (stbc < 0) stbc = 0;
   if (stbc > 3) stbc = 3;
   f |= (uint8_t)(stbc << MCS_FLAGS_STBC_SHIFT);
   return f;
@@ -129,8 +111,9 @@ static size_t build_radiotap(uint8_t *out,
   rt.it_len     = htole16((uint16_t)sizeof(rt));
   rt.it_present = htole32(RT_PRESENT_TX_FLAGS | RT_PRESENT_MCS);
 
-  // NOACK + NOSEQ + FIXED RATE + NO AGGREGATION
-  rt.tx_flags = htole16(0x0008 | 0x0010 | 0x0100 | 0x0080);
+  // ВСЕГДА: NOACK (0x0008) + NOSEQ (0x0010) + FIXED RATE (0x0100)
+  // Дополнительно: NO AGG (0x0080) — чтобы исключить A-MPDU
+  rt.tx_flags   = htole16(0x0008 | 0x0010 | 0x0100 | 0x0080);
 
   rt.mcs_known  = (uint8_t)(MCS_KNOWN_BW | MCS_KNOWN_MCS | MCS_KNOWN_GI | MCS_KNOWN_FEC | MCS_KNOWN_STBC);
   rt.mcs_flags  = mcs_flags_from_args(gi_short, bw40, ldpc, stbc);
@@ -166,22 +149,23 @@ static int send_packet(pcap_t* ph,
 
   uint8_t frame[MAX_FRAME];
   size_t pos = 0;
-  pos += build_radiotap(frame + pos, mcs_idx, gi_short, bw40, ldpc, stbc);
-  pos += build_dot11(frame + pos, seq_num, group_id, tx_id, link_id, radio_port);
+  size_t rt_len  = build_radiotap(frame + pos, mcs_idx, gi_short, bw40, ldpc, stbc);
+  pos += rt_len;
+  size_t mac_len = build_dot11(frame + pos, seq_num, group_id, tx_id, link_id, radio_port);
+  pos += mac_len;
+
   memcpy(frame + pos, payload, payload_len);
   pos += payload_len;
 
   int ret = pcap_inject(ph, frame, (int)pos);
+
+  fprintf(stderr, "[TX] injected payload=%zu rtap=%zu mac=%zu total=%zu ret=%d seq=%u\n",
+          payload_len, rt_len, mac_len, pos, ret, (unsigned)seq_num);
+
   if (ret < 0) {
     fprintf(stderr, "pcap_inject: %s\n", pcap_geterr(ph));
     return -1;
   }
-
-  fprintf(stderr, "TX seq=%u len=%zu MCS=%u GI=%s BW=%s LDPC=%d STBC=%d  G=%u TX=%u L=%u P=%u\n",
-          (unsigned)seq_num, payload_len, (unsigned)mcs_idx,
-          gi_short ? "short" : "long",
-          bw40 ? "40" : "20",
-          ldpc, stbc, group_id, tx_id, link_id, radio_port);
   return 0;
 }
 
@@ -199,8 +183,7 @@ static void usage(const char* prog){
 "  --group_id <0..255>   [0]\n"
 "  --tx_id <0..255>      [0]\n"
 "  --link_id <0..255>    [0]\n"
-"  --radio_port <0..255> [0]\n",
-  prog);
+"  --radio_port <0..255> [0]\n", prog);
 }
 
 int main(int argc, char** argv) {
@@ -298,6 +281,8 @@ int main(int argc, char** argv) {
     ssize_t n = recv(us, buf, sizeof(buf), 0);
     if (n < 0) { if (errno==EINTR) continue; perror("recv"); break; }
     if (n == 0) continue;
+
+    fprintf(stderr, "[TX] UDP-in len=%zd\n", n);
 
     (void)send_packet(ph, buf, (size_t)n, seq,
                       (uint8_t)mcs_idx, gi_short, bw40, ldpc, stbc,
