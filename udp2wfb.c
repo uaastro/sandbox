@@ -129,8 +129,8 @@ static size_t build_radiotap(uint8_t *out,
   rt.it_len     = htole16((uint16_t)sizeof(rt));
   rt.it_present = htole32(RT_PRESENT_TX_FLAGS | RT_PRESENT_MCS);
 
-  // ВСЕГДА: NOACK (0x0008) + NOSEQ (0x0010) + FIXED RATE (0x0100)
-  rt.tx_flags   = htole16(0x0008 | 0x0010 | 0x0100);
+  // NOACK + NOSEQ + FIXED RATE + NO AGGREGATION
+  rt.tx_flags = htole16(0x0008 | 0x0010 | 0x0100 | 0x0080);
 
   rt.mcs_known  = (uint8_t)(MCS_KNOWN_BW | MCS_KNOWN_MCS | MCS_KNOWN_GI | MCS_KNOWN_FEC | MCS_KNOWN_STBC);
   rt.mcs_flags  = mcs_flags_from_args(gi_short, bw40, ldpc, stbc);

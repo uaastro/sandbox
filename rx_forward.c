@@ -1,8 +1,7 @@
-// rx_forward.c — приём 802.11 кадров через pcap и форвардинг payload в UDP 127.0.0.1:5800
+// rx_forward.c — приём 802.11 кадров (monitor) и форвардинг payload -> UDP 127.0.0.1:5800
+// Фикс: если в Radiotap Flags указан FCS — отрезаем последние 4 байта.
 // Сборка: gcc -O2 -Wall -o rx_forward rx_forward.c -lpcap
 // Запуск: sudo ./rx_forward
-//
-// Требования: интерфейс wlx00c0cab8318b уже в monitor mode и на нужном канале.
 
 #define _GNU_SOURCE
 #include <pcap/pcap.h>
@@ -32,11 +31,11 @@
   #endif
 #endif
 
-static const char* IFACE = "wlx00c0cab8318b";
+static const char* IFACE   = "wlx00c0cab8318b";
 static const char* DEST_IP = "127.0.0.1";
 enum { DEST_PORT = 5800 };
 
-enum { MAX_PACKET = 4096 };
+enum { MAX_PACKET = 8192 };
 
 /* 802.11 MAC header (без QoS) */
 struct __attribute__((__packed__)) dot11_hdr {
@@ -53,26 +52,30 @@ static void mac_to_str(const uint8_t m[6], char* out, size_t n) {
   snprintf(out, n, "%02x:%02x:%02x:%02x:%02x:%02x", m[0],m[1],m[2],m[3],m[4],m[5]);
 }
 
-/* простенький парсер Radiotap: извлекаем длину, RSSI/NOISE/ANTENNA (возможны повторы) */
+/* Radiotap parse info */
 typedef struct {
-  uint16_t rt_len;     /* длина radiotap */
-  int8_t   rssi_dbm[4]; /* по индексам антенн 0..3, 127 = нет данных */
+  uint16_t rt_len;        /* длина заголовка radiotap */
+  uint8_t  flags_present; /* поле Flags присутствовало */
+  uint8_t  flags;         /* значение radiotap Flags */
+  int8_t   rssi_dbm[4];   /* по индексам антенн 0..3, 127 = нет данных */
   int8_t   noise_dbm[4];
-  uint8_t  saw_antenna_idx; /* последний встреченный индекс антенны */
+  uint8_t  saw_antenna_idx;
 } rt_info_t;
 
 static void rtinfo_init(rt_info_t* ri){
   memset(ri, 0, sizeof(*ri));
   ri->rt_len = 0;
+  ri->flags_present = 0;
+  ri->flags = 0;
+  ri->saw_antenna_idx = 0;
   for (int i=0;i<4;i++){ ri->rssi_dbm[i] = 127; ri->noise_dbm[i] = 127; }
 }
 
-/* аккуратно двигаем offset с учетом наличия поля */
 static void step(size_t *off, size_t sz, size_t cap){
   if (*off + sz <= cap) *off += sz; else *off = cap;
 }
 
-/* Разбор по порядку стандартных битов present; поддержка расширений (RADIOTAP_EXT) */
+/* Минимальный парсер Radiotap: читаем цепочку present-слов и несколько базовых полей */
 static int parse_radiotap(const uint8_t* pkt, size_t caplen, rt_info_t* out)
 {
   if (caplen < 8) return -1;
@@ -80,7 +83,7 @@ static int parse_radiotap(const uint8_t* pkt, size_t caplen, rt_info_t* out)
   if (it_len > caplen) return -1;
   out->rt_len = it_len;
 
-  /* читаем цепочку present-слов */
+  /* прочитать present chain */
   size_t off = 4;
   uint32_t presents[8]; int np=0;
   do {
@@ -90,28 +93,34 @@ static int parse_radiotap(const uint8_t* pkt, size_t caplen, rt_info_t* out)
     off += 4;
   } while (np < 8 && (presents[np-1] & 0x80000000u));
 
-  /* теперь off указывает на начало полей; идём по списку известных полей
-     ВНИМАНИЕ: здесь игнорируем тонкости выравнивания для редких полей; для базовых ок. */
   size_t foff = off;
 
   for (int wi=0; wi<np; ++wi) {
     uint32_t p = presents[wi];
-    /* бит 0: TSFT (8) */            if (p & (1u<<0))  step(&foff, 8, it_len);
-    /* бит 1: Flags (1) */           if (p & (1u<<1))  step(&foff, 1, it_len);
-    /* бит 2: Rate (1) */            if (p & (1u<<2))  step(&foff, 1, it_len);
-    /* бит 3: Channel (4) */         if (p & (1u<<3))  step(&foff, 4, it_len);
-    /* бит 4: FHSS (2) */            if (p & (1u<<4))  step(&foff, 2, it_len);
-    /* бит 5: dBm Antenna Signal (1) */
+
+    /* bit 0: TSFT (8) */            if (p & (1u<<0))  step(&foff, 8, it_len);
+
+    /* bit 1: Flags (1) */
+    if (p & (1u<<1)) {
+      if (foff + 1 <= it_len) { out->flags_present = 1; out->flags = pkt[foff]; }
+      step(&foff, 1, it_len);
+    }
+
+    /* bit 2: Rate (1) */            if (p & (1u<<2))  step(&foff, 1, it_len);
+    /* bit 3: Channel (4) */         if (p & (1u<<3))  step(&foff, 4, it_len);
+    /* bit 4: FHSS (2) */            if (p & (1u<<4))  step(&foff, 2, it_len);
+
+    /* bit 5: dBm Antenna Signal (1) */
     if (p & (1u<<5)) {
       if (foff + 1 <= it_len) {
         int8_t sig = (int8_t)pkt[foff];
-        /* если есть текущий antenna idx — кладём туда, иначе в [0] */
         int ai = out->saw_antenna_idx < 4 ? out->saw_antenna_idx : 0;
         out->rssi_dbm[ai] = sig;
       }
       step(&foff, 1, it_len);
     }
-    /* бит 6: dBm Antenna Noise (1) */
+
+    /* bit 6: dBm Antenna Noise (1) */
     if (p & (1u<<6)) {
       if (foff + 1 <= it_len) {
         int8_t nz = (int8_t)pkt[foff];
@@ -120,28 +129,24 @@ static int parse_radiotap(const uint8_t* pkt, size_t caplen, rt_info_t* out)
       }
       step(&foff, 1, it_len);
     }
-    /* бит 7: Lock Quality (2) */    if (p & (1u<<7))  step(&foff, 2, it_len);
-    /* бит 8: TX Attenuation (2) */  if (p & (1u<<8))  step(&foff, 2, it_len);
-    /* бит 9: dB TX Atten (2) */     if (p & (1u<<9))  step(&foff, 2, it_len);
-    /* бит 10: dBm TX Power (1) */   if (p & (1u<<10)) step(&foff, 1, it_len);
-    /* бит 11: Antenna (1) */
+
+    /* bit 7: Lock Quality (2) */    if (p & (1u<<7))  step(&foff, 2, it_len);
+    /* bit 8: TX Attenuation (2) */  if (p & (1u<<8))  step(&foff, 2, it_len);
+    /* bit 9: dB TX Atten (2) */     if (p & (1u<<9))  step(&foff, 2, it_len);
+    /* bit10: dBm TX Power (1) */    if (p & (1u<<10)) step(&foff, 1, it_len);
+
+    /* bit11: Antenna index (1) */
     if (p & (1u<<11)) {
-      if (foff + 1 <= it_len) out->saw_antenna_idx = pkt[foff]; /* индекс антенны */
+      if (foff + 1 <= it_len) out->saw_antenna_idx = pkt[foff];
       step(&foff, 1, it_len);
     }
-    /* бит 12: dB Ant Sig (1) */     if (p & (1u<<12)) step(&foff, 1, it_len);
-    /* бит 13: dB Ant Noise (1) */   if (p & (1u<<13)) step(&foff, 1, it_len);
-    /* бит 14: Rx Flags (2) */       if (p & (1u<<14)) step(&foff, 2, it_len);
-    /* бит 15: TX Flags (2) */       if (p & (1u<<15)) step(&foff, 2, it_len);
-    /* бит 16: RTS Retries (1) */    if (p & (1u<<16)) step(&foff, 1, it_len);
-    /* бит 17: Data Retries (1) */   if (p & (1u<<17)) step(&foff, 1, it_len);
-    /* бит 18: xchannel (8) */       if (p & (1u<<18)) step(&foff, 8, it_len);
-    /* бит 19: MCS (3) */            if (p & (1u<<19)) step(&foff, 3, it_len);
-    /* бит 20: AMPDU (8) */          if (p & (1u<<20)) step(&foff, 8, it_len);
-    /* бит 21: VHT (12) */           if (p & (1u<<21)) step(&foff, 12, it_len);
-    /* бит 22: timestamp (12) */     if (p & (1u<<22)) step(&foff, 12, it_len);
-    /* бит 23.. далее — пропускаем по размеру; для нашей задачи не критично */
-    /* Если был EXT, следующий цикл продолжит поля следующих present-слов */
+
+    /* bit12: dB Ant Sig (1) */      if (p & (1u<<12)) step(&foff, 1, it_len);
+    /* bit13: dB Ant Noise (1) */    if (p & (1u<<13)) step(&foff, 1, it_len);
+    /* bit14: RX Flags (2) */        if (p & (1u<<14)) step(&foff, 2, it_len);
+    /* bit15: TX Flags (2) */        if (p & (1u<<15)) step(&foff, 2, it_len);
+    /* bit19: MCS (3) */             if (p & (1u<<19)) step(&foff, 3, it_len);
+    /* Остальные поля пропускаем (для задачи не критично) */
   }
 
   return 0;
@@ -160,7 +165,7 @@ int main(void)
   struct sockaddr_in dst = {0};
   dst.sin_family = AF_INET;
   dst.sin_port = htons(DEST_PORT);
-  inet_aton(DEST_IP, &dst.sin_addr);
+  if (!inet_aton(DEST_IP, &dst.sin_addr)) { fprintf(stderr,"inet_aton failed\n"); return 1; }
 
   /* PCAP */
   char errbuf[PCAP_ERRBUF_SIZE] = {0};
@@ -195,28 +200,49 @@ int main(void)
 
     const struct dot11_hdr* h = (const struct dot11_hdr*)dot11;
 
-    /* Проверим: Data frame? */
+    /* Проверка: тип Data? */
     uint16_t fc = le16toh(h->frame_control);
     uint8_t type = (fc >> 2) & 0x3;
     uint8_t subtype = (fc >> 4) & 0xF;
-    if (!(type == 2 /*Data*/)) continue;
-    /* без QoS — у нас 24B заголовок */
+    if (type != 2) continue; // только Data
+
+    /* Базовая длина заголовка */
     size_t hdr_len = sizeof(struct dot11_hdr);
+
+    /* Если QoS Data — добавить 2 байта QoS Control */
+    int qos = (subtype & 0x08) ? 1 : 0; // QoS subtypes: 8..15
+    if (qos) {
+      if (dlen < hdr_len + 2) continue;
+      hdr_len += 2;
+    }
+
+    /* Если Order=1 и есть HT-Control — добавить 4 байта */
+    int order = (fc & 0x8000) ? 1 : 0; // bit Order
+    if (order) {
+      if (dlen < hdr_len + 4) continue;
+      hdr_len += 4;
+    }
+
     if (dlen < hdr_len) continue;
 
-    /* payload после 24B */
     const uint8_t* payload = dot11 + hdr_len;
     size_t payload_len = dlen - hdr_len;
+
+    /* Если драйвер оставил FCS (Radiotap Flags bit 0x10) — убрать 4 байта */
+    const uint8_t RTAP_F_FCS = 0x10;
+    if (rti.flags_present && (rti.flags & RTAP_F_FCS)) {
+      if (payload_len >= 4) payload_len -= 4;
+    }
     if (payload_len == 0) continue;
 
     /* seq (12 бит) */
     uint16_t seq_ctrl = le16toh(h->seq_ctrl);
     uint16_t seq = (seq_ctrl >> 4) & 0x0FFF;
 
-    /* отладочный лог */
+    /* лог по двум антеннам (если драйвер дал значения) */
     char mac2[32]; mac_to_str(h->addr2, mac2, sizeof(mac2));
-    fprintf(stderr, "RX seq=%u from=%s len=%zu  RSSI[0]=%d RSSI[1]=%d  Noise[0]=%d Noise[1]=%d\n",
-            seq, mac2, payload_len,
+    fprintf(stderr, "RX seq=%u from=%s len=%zu flags=0x%02x  RSSI[0]=%d RSSI[1]=%d  Noise[0]=%d Noise[1]=%d\n",
+            seq, mac2, payload_len, (unsigned)rti.flags,
             (int)rti.rssi_dbm[0], (int)rti.rssi_dbm[1],
             (int)rti.noise_dbm[0], (int)rti.noise_dbm[1]);
 
