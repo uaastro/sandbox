@@ -1,5 +1,5 @@
 // rx_forward_wfb.cpp — RX (monitor) -> UDP 127.0.0.1:5800
-// Добавлен расчёт SNR при отсутствии DBM_ANTNOISE: SNR_est = RSSI - NF_est (EWMA).
+// Periodic stats (default 1000 ms): rssi_min/avg/max, packets, bytes, rate, lost, quality.
 
 #include <pcap/pcap.h>
 #include <arpa/inet.h>
@@ -11,7 +11,29 @@
 #include <cstring>
 #include <climits>
 #include <string>
-#include "wifibroadcast.hpp"
+#include <chrono>
+#include "wifibroadcast.hpp"   // provides RX_ANT_MAX, Radiotap constants
+
+// Fallback Radiotap field indexes (define only if missing)
+#ifndef IEEE80211_RADIOTAP_TSFT
+  #define IEEE80211_RADIOTAP_TSFT              0
+  #define IEEE80211_RADIOTAP_FLAGS             1
+  #define IEEE80211_RADIOTAP_RATE              2
+  #define IEEE80211_RADIOTAP_CHANNEL           3
+  #define IEEE80211_RADIOTAP_FHSS              4
+  #define IEEE80211_RADIOTAP_DBM_ANTSIGNAL     5
+  #define IEEE80211_RADIOTAP_DBM_ANTNOISE      6
+  #define IEEE80211_RADIOTAP_LOCK_QUALITY      7
+  #define IEEE80211_RADIOTAP_TX_ATTENUATION    8
+  #define IEEE80211_RADIOTAP_DB_TX_ATTENUATION 9
+  #define IEEE80211_RADIOTAP_DBM_TX_POWER      10
+  #define IEEE80211_RADIOTAP_ANTENNA           11
+  #define IEEE80211_RADIOTAP_DB_ANTSIGNAL      12
+  #define IEEE80211_RADIOTAP_DB_ANTNOISE       13
+  #define IEEE80211_RADIOTAP_RX_FLAGS          14
+  #define IEEE80211_RADIOTAP_TX_FLAGS          15
+  #define IEEE80211_RADIOTAP_MCS               19
+#endif
 
 #ifdef __linux__
   #include <endian.h>
@@ -29,15 +51,14 @@
   #endif
 #endif
 
+// ---- stats period (ms) ----
+#ifndef STATS_PERIOD_MS
+#define STATS_PERIOD_MS 1000
+#endif
+
 static const char* IFACE   = "wlx00c0cab8318b";
 static const char* DEST_IP = "127.0.0.1";
 static const int   DEST_PORT = 5800;
-
-// ---- Настройки оценки шума ----
-static const float NF_INIT_DBM   = -95.0f;  // стартовый noise floor
-static const float NF_ALPHA_RISE = 0.02f;   // как быстро «подтягиваемся» вверх
-static const float NF_ALPHA_FALL = 0.20f;   // как быстро уходим вниз (к реальному минимуму)
-static const float NF_MARGIN_DB  = 3.0f;    // небольшой зазор от текущего RSSI
 
 #pragma pack(push,1)
 struct dot11_hdr {
@@ -50,58 +71,23 @@ struct dot11_hdr {
 };
 #pragma pack(pop)
 
-static void mac_to_str(const uint8_t m[6], char* out, size_t n) {
-  snprintf(out, n, "%02x:%02x:%02x:%02x:%02x:%02x", m[0],m[1],m[2],m[3],m[4],m[5]);
-}
-static void hexdump(const uint8_t* data, size_t len) {
-  for (size_t i=0; i<len; i+=16) {
-    fprintf(stderr, "%04zx: ", i);
-    size_t j=0;
-    for (; j<16 && i+j<len; ++j) fprintf(stderr, "%02x ", data[i+j]);
-    for (; j<16; ++j) fprintf(stderr, "   ");
-    fprintf(stderr, " |");
-    for (j=0; j<16 && i+j<len; ++j) {
-      unsigned char c = data[i+j];
-      fprintf(stderr, "%c", (c>=32 && c<127)? c: '.');
-    }
-    fprintf(stderr, "|\n");
-  }
-}
+/* ---------------- Radiotap parsing helpers ---------------- */
 
-#ifndef IEEE80211_RADIOTAP_TSFT
-  #define IEEE80211_RADIOTAP_TSFT            0
-  #define IEEE80211_RADIOTAP_FLAGS           1
-  #define IEEE80211_RADIOTAP_RATE            2
-  #define IEEE80211_RADIOTAP_CHANNEL         3
-  #define IEEE80211_RADIOTAP_FHSS            4
-  #define IEEE80211_RADIOTAP_DBM_ANTSIGNAL   5
-  #define IEEE80211_RADIOTAP_DBM_ANTNOISE    6
-  #define IEEE80211_RADIOTAP_LOCK_QUALITY    7
-  #define IEEE80211_RADIOTAP_TX_ATTENUATION  8
-  #define IEEE80211_RADIOTAP_DB_TX_ATTENUATION 9
-  #define IEEE80211_RADIOTAP_DBM_TX_POWER   10
-  #define IEEE80211_RADIOTAP_ANTENNA        11
-  #define IEEE80211_RADIOTAP_DB_ANTSIGNAL   12
-  #define IEEE80211_RADIOTAP_DB_ANTNOISE    13
-  #define IEEE80211_RADIOTAP_RX_FLAGS       14
-  #define IEEE80211_RADIOTAP_TX_FLAGS       15
-  #define IEEE80211_RADIOTAP_MCS            19
-#endif
-
+// Minimal radiotap header
 #pragma pack(push,1)
 struct rt_hdr_min {
   uint8_t  it_version;
   uint8_t  it_pad;
   uint16_t it_len;
-  uint32_t it_present;
+  uint32_t it_present; // may be extended with bit31 set
 };
 #pragma pack(pop)
 
+// Align offset according to radiotap field requirements
 static inline size_t align_for_field(uint8_t field_idx, size_t off) {
   size_t align = 1;
   switch (field_idx) {
-    case IEEE80211_RADIOTAP_TSFT:
-      align = 8; break;
+    case IEEE80211_RADIOTAP_TSFT: align = 8; break;
     case IEEE80211_RADIOTAP_CHANNEL:
     case IEEE80211_RADIOTAP_FHSS:
     case IEEE80211_RADIOTAP_LOCK_QUALITY:
@@ -116,6 +102,8 @@ static inline size_t align_for_field(uint8_t field_idx, size_t off) {
   if (rem) off += (align - rem);
   return off;
 }
+
+// Return size of a radiotap field (only those we touch)
 static inline size_t size_of_field(uint8_t field_idx) {
   switch (field_idx) {
     case IEEE80211_RADIOTAP_TSFT: return 8;
@@ -141,13 +129,14 @@ static inline size_t size_of_field(uint8_t field_idx) {
 
 struct RtStats {
   uint16_t rt_len{0};
-  uint8_t  flags{0};              // radiotap Flags (0x10=FCS, 0x20=DATAPAD)
+  uint8_t  flags{0};              // radiotap Flags (0x10=FCS present, 0x20=DATAPAD)
   uint8_t  antenna[RX_ANT_MAX];
-  int8_t   rssi[RX_ANT_MAX];
-  int8_t   noise[RX_ANT_MAX];
+  int8_t   rssi[RX_ANT_MAX];      // SCHAR_MIN means "not present"
+  int8_t   noise[RX_ANT_MAX];     // SCHAR_MAX means "not present"
   int      chains{0};
 };
 
+// Parse radiotap like rx.cpp: fill per-chain RSSI/NOISE; advance chain on ANTENNA.
 static bool parse_radiotap_rxcpp_like(const uint8_t* p, size_t caplen, RtStats& rs)
 {
   if (caplen < sizeof(rt_hdr_min)) return false;
@@ -160,6 +149,7 @@ static bool parse_radiotap_rxcpp_like(const uint8_t* p, size_t caplen, RtStats& 
   rs.chains = 0;
   for (int i=0;i<RX_ANT_MAX;i++){ rs.antenna[i]=0xff; rs.rssi[i]=SCHAR_MIN; rs.noise[i]=SCHAR_MAX; }
 
+  // collect present chain
   uint32_t presents[8]; int np=0;
   size_t poff = offsetof(rt_hdr_min, it_present);
   do {
@@ -195,7 +185,7 @@ static bool parse_radiotap_rxcpp_like(const uint8_t* p, size_t caplen, RtStats& 
         case IEEE80211_RADIOTAP_ANTENNA:
           if (ant_idx < RX_ANT_MAX) {
             rs.antenna[ant_idx] = *field;
-            ant_idx++; // как в rx.cpp
+            ant_idx++; // move to next chain (as in rx.cpp)
           }
           break;
         default: break;
@@ -207,32 +197,15 @@ static bool parse_radiotap_rxcpp_like(const uint8_t* p, size_t caplen, RtStats& 
   return true;
 }
 
-// ---- простая EWMA-оценка noise floor per-chain ----
-struct NoiseEwma {
-  float nf[RX_ANT_MAX];
-  NoiseEwma() { for (int i=0;i<RX_ANT_MAX;i++) nf[i]=NF_INIT_DBM; }
-  void update(int chain, int8_t rssi_dbm, bool have_noise, int8_t noise_dbm) {
-    if (chain<0 || chain>=RX_ANT_MAX) return;
-    if (have_noise) {
-      nf[chain] = (float)noise_dbm; // если драйвер дал noise — берём как есть
-      return;
-    }
-    // если шума нет — аккуратно подстраиваемся: хотим держаться чуть ниже текущего RSSI
-    float target = (float)rssi_dbm - NF_MARGIN_DB;
-    float alpha  = (target > nf[chain]) ? NF_ALPHA_RISE : NF_ALPHA_FALL;
-    nf[chain] = nf[chain] + alpha * (target - nf[chain]);
-  }
-  float get(int chain) const { return (chain>=0 && chain<RX_ANT_MAX) ? nf[chain] : NF_INIT_DBM; }
-};
-
+/* ----------------------------- main ----------------------------- */
 int main() {
-  // UDP out socket (разово)
+  // UDP socket (single)
   int us = socket(AF_INET, SOCK_DGRAM, 0);
   if (us < 0) { perror("socket"); return 1; }
   sockaddr_in dst{}; dst.sin_family=AF_INET; dst.sin_port=htons(DEST_PORT);
   inet_aton(DEST_IP, &dst.sin_addr);
 
-  // PCAP
+  // PCAP capture
   char errbuf[PCAP_ERRBUF_SIZE] = {0};
   pcap_t* ph = pcap_create(IFACE, errbuf);
   if (!ph) { fprintf(stderr, "pcap_create(%s): %s\n", IFACE, errbuf); return 1; }
@@ -241,78 +214,140 @@ int main() {
     fprintf(stderr, "pcap_activate(%s): %s\n", IFACE, pcap_geterr(ph)); return 1;
   }
 
-  fprintf(stderr, "RX on %s -> UDP %s:%d (radiotap + SNR_est)\n", IFACE, DEST_IP, DEST_PORT);
+  fprintf(stderr, "RX on %s -> UDP %s:%d | stats every %d ms\n",
+          IFACE, DEST_IP, DEST_PORT, STATS_PERIOD_MS);
 
-  NoiseEwma nf_est; // per-chain оценка шума
+  // Stats accumulators (per period)
+  auto t0 = std::chrono::steady_clock::now();
+  uint64_t bytes_period = 0;
+  uint32_t rx_pkts_period = 0;
+  int rssi_min =  127;   // dBm
+  int rssi_max = -127;   // dBm
+  int64_t rssi_sum = 0;  // for average
+  uint32_t rssi_samples = 0;
+
+  // Loss tracking (12-bit seq)
+  bool have_seq = false;
+  uint16_t expect_seq = 0;      // next expected seq (mod 4096)
+  uint32_t lost_period = 0;     // lost packets (by seq gap) this period
 
   while (true) {
     struct pcap_pkthdr* hdr = nullptr;
     const u_char* pkt = nullptr;
     int rc = pcap_next_ex(ph, &hdr, &pkt);
-    if (rc == 0) continue;
-    if (rc < 0) { fprintf(stderr, "pcap_next_ex: %s\n", pcap_geterr(ph)); break; }
-    if (!pkt || hdr->caplen < sizeof(rt_hdr_min)) continue;
+    if (rc == 0) {
+      // periodic stats check even on timeout
+    } else if (rc < 0) {
+      fprintf(stderr, "pcap_next_ex: %s\n", pcap_geterr(ph));
+      break;
+    } else if (pkt && hdr->caplen >= sizeof(rt_hdr_min)) {
 
-    RtStats rs;
-    if (!parse_radiotap_rxcpp_like(pkt, hdr->caplen, rs)) continue;
-    if (rs.rt_len >= hdr->caplen) continue;
+      // Parse radiotap
+      RtStats rs;
+      if (!parse_radiotap_rxcpp_like(pkt, hdr->caplen, rs)) goto stats_tick;
+      if (rs.rt_len >= hdr->caplen) goto stats_tick;
 
-    const uint8_t* dot11 = pkt + rs.rt_len;
-    size_t dlen = hdr->caplen - rs.rt_len;
-    if (dlen < sizeof(dot11_hdr)) continue;
+      const uint8_t* dot11 = pkt + rs.rt_len;
+      size_t dlen = hdr->caplen - rs.rt_len;
+      if (dlen < sizeof(dot11_hdr)) goto stats_tick;
 
-    const dot11_hdr* h = reinterpret_cast<const dot11_hdr*>(dot11);
-    uint16_t fc = le16toh(h->frame_control);
-    uint8_t type = (fc >> 2) & 0x3;
-    uint8_t subtype = (fc >> 4) & 0xF;
-    if (type != 2) continue; // Data
+      const dot11_hdr* h = reinterpret_cast<const dot11_hdr*>(dot11);
+      uint16_t fc = le16toh(h->frame_control);
+      uint8_t type = (fc >> 2) & 0x3;
+      uint8_t subtype = (fc >> 4) & 0xF;
+      if (type != 2) goto stats_tick; // only Data
 
-    size_t hdr_len = sizeof(dot11_hdr);
-    int qos = (subtype & 0x08) ? 1 : 0;
-    if (qos) { if (dlen < hdr_len + 2) continue; hdr_len += 2; }
-    int order = (fc & 0x8000) ? 1 : 0;
-    if (order) { if (dlen < hdr_len + 4) continue; hdr_len += 4; }
+      // MAC header length
+      size_t hdr_len = sizeof(dot11_hdr);
+      int qos = (subtype & 0x08) ? 1 : 0;
+      if (qos) { if (dlen < hdr_len + 2) goto stats_tick; hdr_len += 2; }
+      int order = (fc & 0x8000) ? 1 : 0;
+      if (order) { if (dlen < hdr_len + 4) goto stats_tick; hdr_len += 4; }
 
-    if (rs.flags & 0x20) { // DATAPAD
-      size_t aligned = (hdr_len + 3u) & ~3u;
-      if (aligned > dlen) continue;
-      hdr_len = aligned;
+      // DATAPAD alignment (radiotap flag 0x20)
+      if (rs.flags & 0x20) {
+        size_t aligned = (hdr_len + 3u) & ~3u;
+        if (aligned > dlen) goto stats_tick;
+        hdr_len = aligned;
+      }
+
+      // Payload and FCS handling (radiotap flag 0x10)
+      const uint8_t* payload = dot11 + hdr_len;
+      size_t payload_len = dlen - hdr_len;
+      if ((rs.flags & 0x10) && payload_len >= 4) payload_len -= 4;
+      if (payload_len == 0) goto stats_tick;
+
+      // Sequence tracking (12-bit)
+      uint16_t seq = (le16toh(h->seq_ctrl) >> 4) & 0x0FFF;
+      if (!have_seq) {
+        have_seq = true;
+        expect_seq = (uint16_t)((seq + 1) & 0x0FFF);
+      } else {
+        if (seq != expect_seq) {
+          // compute gap modulo 4096
+          uint16_t gap = (uint16_t)((seq - expect_seq) & 0x0FFF);
+          // if gap is small (normal forward jump), count as lost
+          lost_period += gap;
+          expect_seq = (uint16_t)((seq + 1) & 0x0FFF);
+        } else {
+          expect_seq = (uint16_t)((expect_seq + 1) & 0x0FFF);
+        }
+      }
+
+      // Choose per-packet RSSI: take the best (max) across chains
+      int pkt_rssi_valid = 0;
+      int pkt_rssi = -127;
+      for (int i=0;i<rs.chains && i<RX_ANT_MAX; ++i) {
+        if (rs.rssi[i] != SCHAR_MIN) {
+          pkt_rssi_valid = 1;
+          if (rs.rssi[i] > pkt_rssi) pkt_rssi = rs.rssi[i];
+        }
+      }
+      if (pkt_rssi_valid) {
+        if (pkt_rssi < rssi_min) rssi_min = pkt_rssi;
+        if (pkt_rssi > rssi_max) rssi_max = pkt_rssi;
+        rssi_sum += pkt_rssi;
+        rssi_samples++;
+      }
+
+      // Forward payload to UDP
+      (void)sendto(us, payload, payload_len, 0, (sockaddr*)&dst, sizeof(dst));
+
+      // Accumulate stats
+      rx_pkts_period += 1;
+      bytes_period   += payload_len;
     }
 
-    const uint8_t* payload = dot11 + hdr_len;
-    size_t payload_len = dlen - hdr_len;
-    if ((rs.flags & 0x10) && payload_len >= 4) payload_len -= 4; // FCS
-    if (payload_len == 0) continue;
+stats_tick:
+    // Periodic stats output
+    auto now = std::chrono::steady_clock::now();
+    auto ms  = std::chrono::duration_cast<std::chrono::milliseconds>(now - t0).count();
+    if (ms >= STATS_PERIOD_MS) {
+      // data rate in kbps over the elapsed period
+      double seconds = (double)ms / 1000.0;
+      double kbps = seconds > 0.0 ? (bytes_period * 8.0 / 1000.0) / seconds : 0.0;
 
-    uint16_t seq = (le16toh(h->seq_ctrl) >> 4) & 0x0FFF;
-    char mac2[32]; mac_to_str(h->addr2, mac2, sizeof(mac2));
+      // quality: rx / (rx + lost) * 100
+      uint32_t expected = rx_pkts_period + lost_period;
+      int quality = expected ? (int)((rx_pkts_period * 100.0) / expected + 0.5) : 100;
 
-    fprintf(stderr, "[RX] seq=%u from=%s payload_len=%zu flags=0x%02x\n",
-            seq, mac2, payload_len, rs.flags);
+      // RSSI stats
+      double rssi_avg = (rssi_samples > 0) ? ((double)rssi_sum / (double)rssi_samples) : 0.0;
+      if (rssi_samples == 0) { rssi_min = 0; rssi_max = 0; }
 
-    // per-chain вывод: если нет noise — печатаем nf_est и snr_est
-    for (int i=0;i<rs.chains && i<RX_ANT_MAX; ++i) {
-      const int8_t r = rs.rssi[i];
-      const int8_t n = rs.noise[i];
-      bool have_noise = (n != SCHAR_MAX);
-      nf_est.update(i, r, have_noise, n);
-      float nf_i = nf_est.get(i);
-      int snr_exact = 0, snr_est = 0;
-      if (have_noise) snr_exact = (int)r - (int)n;
-      snr_est = (int)lroundf((float)r - nf_i);
+      fprintf(stderr,
+        "[STATS] period=%lld ms | pkts=%u lost=%u quality=%d%% | bytes=%llu rate=%.1f kbps | rssi min/avg/max = %d/%.1f/%d dBm\n",
+        (long long)ms, rx_pkts_period, lost_period, quality,
+        (unsigned long long)bytes_period, kbps,
+        rssi_min, rssi_avg, rssi_max);
 
-      if (have_noise)
-        fprintf(stderr, "   ant[%d]=%u  rssi=%d dBm  noise=%d dBm  snr=%d dB\n",
-                i, (unsigned)rs.antenna[i], (int)r, (int)n, snr_exact);
-      else
-        fprintf(stderr, "   ant[%d]=%u  rssi=%d dBm  noise=NA  nf_est=%.1f dBm  snr_est=%d dB\n",
-                i, (unsigned)rs.antenna[i], (int)r, nf_i, snr_est);
+      // reset period accumulators
+      t0 = now;
+      bytes_period = 0;
+      rx_pkts_period = 0;
+      lost_period = 0;
+      rssi_min = 127; rssi_max = -127; rssi_sum = 0; rssi_samples = 0;
     }
-
-    hexdump(payload, payload_len);
-
-    ssize_t sent = sendto(us, payload, payload_len, 0, (sockaddr*)&dst, sizeof(dst));
-    fprintf(stderr, "[RX] UDP-out len=%zd\n", sent);
   }
 
   close(us);
