@@ -1,11 +1,14 @@
-// wfb_rx.c — 802.11 capture (monitor mode) -> UDP 127.0.0.1:5800
-// Periodic stats (default 1000 ms): rssi_min/avg/max, packets, bytes, kbps, lost, quality.
+// wfb_rx.c — 802.11 capture (monitor mode) -> UDP (configurable)
+// CLI (optional): --ip, --port, --tx_id, --link_id, --radio_port, --help
+// Required positional: <wlan_iface>
+// Stats every STATS_PERIOD_MS (default 1000 ms): rssi min/avg/max, packets, bytes, kbps, lost, quality.
 
 #include <pcap/pcap.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
+#include <getopt.h>
 #include <signal.h>
 #include <errno.h>
 #include <arpa/inet.h>
@@ -13,7 +16,6 @@
 #include <unistd.h>
 #include <time.h>
 #include <limits.h>
-#include <math.h>
 
 #ifdef __linux__
   #include <endian.h>
@@ -38,8 +40,9 @@
 #define STATS_PERIOD_MS 1000
 #endif
 
-static const char* DEST_IP = "127.0.0.1";
-static const int   DEST_PORT = 5800;
+/* Defaults */
+static const char* g_dest_ip_default   = "127.0.0.1";
+static const int   g_dest_port_default = 5600;
 
 /* Monotonic milliseconds */
 static uint64_t now_ms(void) {
@@ -88,6 +91,7 @@ static int parse_radiotap_rx(const uint8_t* p, size_t caplen, struct rt_stats* r
     uint32_t pres = presents[wi];
     for (uint8_t f=0; f<32; ++f) {
       if (!(pres & (1u<<f))) continue;
+      /* alignment and size helpers from defs */
       off = wfb_rt_align(f, off);
       size_t sz = wfb_rt_size(f);
       if (sz==0 || off + sz > it_len) { off += sz; continue; }
@@ -122,13 +126,81 @@ static int parse_radiotap_rx(const uint8_t* p, size_t caplen, struct rt_stats* r
 static volatile int g_run = 1;
 static void on_sigint(int){ g_run = 0; }
 
+struct cli_cfg {
+  const char* iface;
+  const char* ip;
+  int port;
+  int tx_id;
+  int link_id;
+  int radio_port;
+};
+
+static void print_help(const char* prog)
+{
+  printf(
+    "Usage: sudo %s [options] <wlan_iface>\n"
+    "Options:\n"
+    "  --ip <addr>         UDP destination IP (default: %s)\n"
+    "  --port <num>        UDP destination port (default: %d)\n"
+    "  --tx_id <id>        Filter by TX ID (addr2[5]); -1 disables filter (default: 0)\n"
+    "  --link_id <id>      Filter by Link ID (addr3[4]); -1 disables filter (default: 0)\n"
+    "  --radio_port <id>   Filter by Radio Port (addr3[5]); -1 disables filter (default: 0)\n"
+    "  --help              Show this help and exit\n"
+    "\nExample:\n"
+    "  sudo %s --ip 127.0.0.1 --port 5600 --tx_id -1 --link_id 0 --radio_port 0 wlan0\n",
+    prog, g_dest_ip_default, g_dest_port_default, prog
+  );
+}
+
+static int parse_cli(int argc, char** argv, struct cli_cfg* cfg)
+{
+  cfg->ip = g_dest_ip_default;
+  cfg->port = g_dest_port_default;
+  cfg->tx_id = 0;       /* filters default to 0; use -1 to disable */
+  cfg->link_id = 0;
+  cfg->radio_port = 0;
+
+  static struct option longopts[] = {
+    {"ip",         required_argument, 0, 0},
+    {"port",       required_argument, 0, 0},
+    {"tx_id",      required_argument, 0, 0},
+    {"link_id",    required_argument, 0, 0},
+    {"radio_port", required_argument, 0, 0},
+    {"help",       no_argument,       0, 0},
+    {0,0,0,0}
+  };
+
+  int optidx = 0;
+  while (1) {
+    int c = getopt_long(argc, argv, "", longopts, &optidx);
+    if (c == -1) break;
+    if (c == 0) {
+      const char* name = longopts[optidx].name;
+      const char* val  = optarg ? optarg : "";
+      if      (strcmp(name,"ip")==0)         cfg->ip = val;
+      else if (strcmp(name,"port")==0)       cfg->port = atoi(val);
+      else if (strcmp(name,"tx_id")==0)      cfg->tx_id = atoi(val);
+      else if (strcmp(name,"link_id")==0)    cfg->link_id = atoi(val);
+      else if (strcmp(name,"radio_port")==0) cfg->radio_port = atoi(val);
+      else if (strcmp(name,"help")==0) {
+        print_help(argv[0]);
+        exit(0);
+      }
+    }
+  }
+  if (optind >= argc) {
+    fprintf(stderr, "Error: missing required <wlan_iface>. Use --help for usage.\n");
+    return -1;
+  }
+  cfg->iface = argv[optind];
+  return 0;
+}
+
 int main(int argc, char** argv)
 {
-  if (argc < 2) {
-    fprintf(stderr, "Usage: sudo %s <wlan_iface>\n", argv[0]);
-    return 1;
-  }
-  const char* iface = argv[1];
+  struct cli_cfg cli;
+  if (parse_cli(argc, argv, &cli) != 0) return 1;
+
   signal(SIGINT, on_sigint);
 
   /* UDP out socket */
@@ -136,21 +208,27 @@ int main(int argc, char** argv)
   if (us < 0) { perror("socket"); return 1; }
   struct sockaddr_in dst;
   memset(&dst, 0, sizeof(dst));
-  dst.sin_family = AF_INET; dst.sin_port = htons(DEST_PORT);
-  inet_aton(DEST_IP, &dst.sin_addr);
-
-  /* PCAP capture */
-  char errbuf[PCAP_ERRBUF_SIZE] = {0};
-  pcap_t* ph = pcap_create(iface, errbuf);
-  if (!ph) { fprintf(stderr, "pcap_create(%s): %s\n", iface, errbuf); return 1; }
-  (void)pcap_set_immediate_mode(ph, 1);
-  if (pcap_activate(ph) != 0) {
-    fprintf(stderr, "pcap_activate(%s): %s\n", iface, pcap_geterr(ph));
+  dst.sin_family = AF_INET;
+  dst.sin_port = htons(cli.port);
+  if (!inet_aton(cli.ip, &dst.sin_addr)) {
+    fprintf(stderr, "inet_aton failed for %s\n", cli.ip);
     return 1;
   }
 
-  fprintf(stderr, "RX: %s -> UDP %s:%d | stats every %d ms\n",
-          iface, DEST_IP, DEST_PORT, STATS_PERIOD_MS);
+  /* PCAP capture */
+  char errbuf[PCAP_ERRBUF_SIZE] = {0};
+  pcap_t* ph = pcap_create(cli.iface, errbuf);
+  if (!ph) { fprintf(stderr, "pcap_create(%s): %s\n", cli.iface, errbuf); return 1; }
+  (void)pcap_set_immediate_mode(ph, 1);
+  if (pcap_activate(ph) != 0) {
+    fprintf(stderr, "pcap_activate(%s): %s\n", cli.iface, pcap_geterr(ph));
+    return 1;
+  }
+
+  fprintf(stderr,
+          "RX: %s -> UDP %s:%d | stats %d ms | filters: TX=%d LINK=%d PORT=%d (use -1 to disable)\n",
+          cli.iface, cli.ip, cli.port, STATS_PERIOD_MS,
+          cli.tx_id, cli.link_id, cli.radio_port);
 
   /* Period accumulators */
   uint64_t t0 = now_ms();
@@ -171,7 +249,7 @@ int main(int argc, char** argv)
     const u_char* pkt = NULL;
     int rc = pcap_next_ex(ph, &hdr, &pkt);
     if (rc == 0) {
-      /* periodic tick still handled below */
+      /* periodic tick handled below */
     } else if (rc < 0) {
       fprintf(stderr, "pcap_next_ex: %s\n", pcap_geterr(ph));
       break;
@@ -208,6 +286,14 @@ int main(int argc, char** argv)
       if ((rs.flags & RADIOTAP_F_FCS) && payload_len >= 4) payload_len -= 4;
       if (payload_len == 0) goto stats_tick;
 
+      /* Address-based filters (defaults active; -1 disables) */
+      uint8_t tx_id      = h->addr2[5];
+      uint8_t link_id    = h->addr3[4];
+      uint8_t radio_port = h->addr3[5];
+      if (cli.tx_id      >= 0 && tx_id      != (uint8_t)cli.tx_id)      goto stats_tick;
+      if (cli.link_id    >= 0 && link_id    != (uint8_t)cli.link_id)    goto stats_tick;
+      if (cli.radio_port >= 0 && radio_port != (uint8_t)cli.radio_port) goto stats_tick;
+
       /* Sequence / loss */
       uint16_t seq = (le16toh(h->seq_ctrl) >> 4) & 0x0FFF;
       if (!have_seq) {
@@ -239,7 +325,7 @@ int main(int argc, char** argv)
         rssi_samples++;
       }
 
-      /* Forward payload to UDP */
+      /* Forward payload to UDP destination */
       (void)sendto(us, payload, payload_len, 0, (struct sockaddr*)&dst, sizeof(dst));
 
       /* Accumulate stats */
