@@ -1,7 +1,9 @@
 // wfb_rx.c — 802.11 capture (monitor mode) -> UDP (configurable)
 // CLI (optional): --ip, --port, --tx_id, --link_id, --radio_port, --help
 // Required positional: <wlan_iface>
-// Stats every STATS_PERIOD_MS (default 1000 ms): rssi min/avg/max, packets, bytes, kbps, lost, quality.
+// Stats every STATS_PERIOD_MS (default 1000 ms):
+//   - Global: packets, bytes, kbps, lost, quality, RSSI min/avg/max (per-packet best chain)
+//   - Per-antenna: pkts, lost, quality, RSSI min/avg/max per chain
 
 #include <pcap/pcap.h>
 #include <stdio.h>
@@ -91,7 +93,6 @@ static int parse_radiotap_rx(const uint8_t* p, size_t caplen, struct rt_stats* r
     uint32_t pres = presents[wi];
     for (uint8_t f=0; f<32; ++f) {
       if (!(pres & (1u<<f))) continue;
-      /* alignment and size helpers from defs */
       off = wfb_rt_align(f, off);
       size_t sz = wfb_rt_size(f);
       if (sz==0 || off + sz > it_len) { off += sz; continue; }
@@ -196,6 +197,32 @@ static int parse_cli(int argc, char** argv, struct cli_cfg* cfg)
   return 0;
 }
 
+/* Per-antenna accumulators for current stats period */
+struct ant_stats {
+  uint8_t ant_id;          /* radiotap ANTENNA value (last seen) */
+  int rssi_min;
+  int rssi_max;
+  int64_t rssi_sum;
+  uint32_t rssi_samples;   /* also counts as per-antenna received packets */
+  /* per-antenna loss tracking via 12-bit seq */
+  int have_seq;
+  uint16_t expect_seq;
+  uint32_t lost;
+};
+
+static void ant_stats_reset(struct ant_stats* a) {
+  for (int i=0;i<RX_ANT_MAX;i++) {
+    a[i].ant_id = 0xff;
+    a[i].rssi_min = 127;
+    a[i].rssi_max = -127;
+    a[i].rssi_sum = 0;
+    a[i].rssi_samples = 0;
+    a[i].have_seq = 0;
+    a[i].expect_seq = 0;
+    a[i].lost = 0;
+  }
+}
+
 int main(int argc, char** argv)
 {
   struct cli_cfg cli;
@@ -230,7 +257,7 @@ int main(int argc, char** argv)
           cli.iface, cli.ip, cli.port, STATS_PERIOD_MS,
           cli.tx_id, cli.link_id, cli.radio_port);
 
-  /* Period accumulators */
+  /* Global period accumulators */
   uint64_t t0 = now_ms();
   uint64_t bytes_period = 0;
   uint32_t rx_pkts_period = 0;
@@ -238,11 +265,14 @@ int main(int argc, char** argv)
   int rssi_max = -127;
   int64_t rssi_sum = 0;
   uint32_t rssi_samples = 0;
-
-  /* Loss tracking via 12-bit seq */
+  /* Global loss via 12-bit seq */
   int have_seq = 0;
   uint16_t expect_seq = 0;
   uint32_t lost_period = 0;
+
+  /* Per-antenna period accumulators */
+  struct ant_stats A[RX_ANT_MAX];
+  ant_stats_reset(A);
 
   while (g_run) {
     struct pcap_pkthdr* hdr = NULL;
@@ -294,7 +324,7 @@ int main(int argc, char** argv)
       if (cli.link_id    >= 0 && link_id    != (uint8_t)cli.link_id)    goto stats_tick;
       if (cli.radio_port >= 0 && radio_port != (uint8_t)cli.radio_port) goto stats_tick;
 
-      /* Sequence / loss */
+      /* Global sequence / loss */
       uint16_t seq = (le16toh(h->seq_ctrl) >> 4) & 0x0FFF;
       if (!have_seq) {
         have_seq = 1;
@@ -309,7 +339,34 @@ int main(int argc, char** argv)
         }
       }
 
-      /* Per-packet RSSI = max across chains that are present */
+      /* Per-antenna sequence/loss + RSSI accumulation:
+       * If a chain reports RSSI for this frame, we treat it as "received" for that chain.
+       * Loss per chain is computed vs its own last seen seq (12-bit).
+       */
+      for (int i=0;i<rs.chains && i<RX_ANT_MAX; ++i) {
+        if (rs.rssi[i] == SCHAR_MIN) continue; /* chain absent in this frame */
+        if (!A[i].have_seq) {
+          A[i].have_seq = 1;
+          A[i].expect_seq = (uint16_t)((seq + 1) & 0x0FFF);
+        } else {
+          if (seq != A[i].expect_seq) {
+            uint16_t gap = (uint16_t)((seq - A[i].expect_seq) & 0x0FFF);
+            A[i].lost += gap;
+            A[i].expect_seq = (uint16_t)((seq + 1) & 0x0FFF);
+          } else {
+            A[i].expect_seq = (uint16_t)((A[i].expect_seq + 1) & 0x0FFF);
+          }
+        }
+        /* RSSI stats for this chain */
+        int r = rs.rssi[i];
+        if (r < A[i].rssi_min) A[i].rssi_min = r;
+        if (r > A[i].rssi_max) A[i].rssi_max = r;
+        A[i].rssi_sum += r;
+        A[i].rssi_samples++;
+        A[i].ant_id = rs.antenna[i];
+      }
+
+      /* Global per-packet RSSI = best chain */
       int pkt_rssi_valid = 0;
       int pkt_rssi = -127;
       for (int i=0;i<rs.chains && i<RX_ANT_MAX; ++i) {
@@ -328,7 +385,7 @@ int main(int argc, char** argv)
       /* Forward payload to UDP destination */
       (void)sendto(us, payload, payload_len, 0, (struct sockaddr*)&dst, sizeof(dst));
 
-      /* Accumulate stats */
+      /* Global accumulators */
       rx_pkts_period += 1;
       bytes_period   += payload_len;
     }
@@ -343,11 +400,26 @@ stats_tick:
       double rssi_avg = (rssi_samples > 0) ? ((double)rssi_sum / (double)rssi_samples) : 0.0;
       if (rssi_samples == 0) { rssi_min = 0; rssi_max = 0; }
 
+      /* Print global stats */
       fprintf(stderr,
-        "[STATS] dt=%llu ms | pkts=%u lost=%u quality=%d%% | bytes=%llu rate=%.1f kbps | rssi min/avg/max = %d/%.1f/%d dBm\n",
+        "[STATS] dt=%llu ms | pkts=%u lost=%u quality=%d%% | bytes=%llu rate=%.1f kbps | RSSI best-chain min/avg/max = %d/%.1f/%d dBm\n",
         (unsigned long long)(t1 - t0), rx_pkts_period, lost_period, quality,
         (unsigned long long)bytes_period, kbps,
         rssi_min, rssi_avg, rssi_max);
+
+      /* Print per-antenna stats */
+      for (int i=0;i<RX_ANT_MAX; ++i) {
+        if (A[i].rssi_samples == 0 && A[i].lost == 0) continue; /* silent chain in this window */
+        uint32_t exp_i = A[i].rssi_samples + A[i].lost;
+        int qual_i = exp_i ? (int)((A[i].rssi_samples * 100.0) / exp_i + 0.5) : 100;
+        double avg_i = (A[i].rssi_samples > 0) ? ((double)A[i].rssi_sum / (double)A[i].rssi_samples) : 0.0;
+        int min_i = (A[i].rssi_samples > 0) ? A[i].rssi_min : 0;
+        int max_i = (A[i].rssi_samples > 0) ? A[i].rssi_max : 0;
+        fprintf(stderr,
+          "   [ANT%u] id=%u pkts=%u lost=%u quality=%d%% | rssi min/avg/max = %d/%.1f/%d dBm\n",
+          i, (unsigned)(A[i].ant_id==0xff? i : A[i].ant_id),
+          A[i].rssi_samples, A[i].lost, qual_i, min_i, avg_i, max_i);
+      }
 
       /* reset period */
       t0 = t1;
@@ -355,6 +427,7 @@ stats_tick:
       rx_pkts_period = 0;
       lost_period = 0;
       rssi_min = 127; rssi_max = -127; rssi_sum = 0; rssi_samples = 0;
+      ant_stats_reset(A);
     }
   }
 
