@@ -1,9 +1,11 @@
-// wfb_rx.c — 802.11 capture (monitor mode) -> UDP (configurable)
-// CLI (optional): --ip, --port, --tx_id, --link_id, --radio_port, --help
-// Required positional: <wlan_iface>
-// Stats every STATS_PERIOD_MS (default 1000 ms):
-//   - Global: packets, bytes, kbps, lost, quality, RSSI min/avg/max (per-packet best chain)
-//   - Per-antenna: pkts, lost, quality, RSSI min/avg/max per chain
+// wfb_rx.c — multi-interface 802.11 capture (monitor mode) -> UDP (configurable)
+// - Supports multiple WLAN interfaces (positional args): receive diversity
+// - A frame is accepted if received on at least one interface (dedup by 12-bit seq)
+// - Per-antenna stats labeled ANTabc: a=iface index, bc=antenna index (00..99)
+// - CLI: --ip, --port, --tx_id, --link_id, --radio_port, --help
+// - Periodic stats (STATS_PERIOD_MS, default 1000 ms):
+//     Global: packets, bytes, kbps, lost, quality, RSSI(best-chain) min/avg/max
+//     Per-antenna (per interface): pkts, lost, quality, RSSI min/avg/max
 
 #include <pcap/pcap.h>
 #include <stdio.h>
@@ -15,6 +17,7 @@
 #include <errno.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
+#include <sys/select.h>
 #include <unistd.h>
 #include <time.h>
 #include <limits.h>
@@ -41,6 +44,7 @@
 #ifndef STATS_PERIOD_MS
 #define STATS_PERIOD_MS 1000
 #endif
+#define MAX_IFS 8
 
 /* Defaults */
 static const char* g_dest_ip_default   = "127.0.0.1";
@@ -53,7 +57,7 @@ static uint64_t now_ms(void) {
   return (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull;
 }
 
-/* Parse radiotap: fill flags + per-chain rssi/noise. Chain index advances on ANTENNA. */
+/* Radiotap RX parse */
 struct rt_stats {
   uint16_t rt_len;
   uint8_t  flags;
@@ -75,7 +79,6 @@ static int parse_radiotap_rx(const uint8_t* p, size_t caplen, struct rt_stats* r
   rs->chains = 0;
   for (int i=0;i<RX_ANT_MAX;i++){ rs->antenna[i]=0xff; rs->rssi[i]=SCHAR_MIN; rs->noise[i]=SCHAR_MAX; }
 
-  /* present chain */
   uint32_t presents[8]; int np=0;
   size_t poff = offsetof(struct wfb_radiotap_hdr_min, it_present);
   do {
@@ -96,24 +99,14 @@ static int parse_radiotap_rx(const uint8_t* p, size_t caplen, struct rt_stats* r
       off = wfb_rt_align(f, off);
       size_t sz = wfb_rt_size(f);
       if (sz==0 || off + sz > it_len) { off += sz; continue; }
-
       const uint8_t* field = p + off;
 
       switch (f) {
-        case IEEE80211_RADIOTAP_FLAGS:
-          rs->flags = *field;
-          break;
-        case IEEE80211_RADIOTAP_DBM_ANTSIGNAL:
-          if (ant_idx < RX_ANT_MAX) rs->rssi[ant_idx] = (int8_t)*field;
-          break;
-        case IEEE80211_RADIOTAP_DBM_ANTNOISE:
-          if (ant_idx < RX_ANT_MAX) rs->noise[ant_idx] = (int8_t)*field;
-          break;
+        case IEEE80211_RADIOTAP_FLAGS:        rs->flags = *field; break;
+        case IEEE80211_RADIOTAP_DBM_ANTSIGNAL:if (ant_idx < RX_ANT_MAX) rs->rssi[ant_idx] = (int8_t)*field; break;
+        case IEEE80211_RADIOTAP_DBM_ANTNOISE: if (ant_idx < RX_ANT_MAX) rs->noise[ant_idx] = (int8_t)*field; break;
         case IEEE80211_RADIOTAP_ANTENNA:
-          if (ant_idx < RX_ANT_MAX) {
-            rs->antenna[ant_idx] = *field;
-            ant_idx++; /* advance chain as in rx.cpp */
-          }
+          if (ant_idx < RX_ANT_MAX) { rs->antenna[ant_idx] = *field; ant_idx++; }
           break;
         default: break;
       }
@@ -124,11 +117,58 @@ static int parse_radiotap_rx(const uint8_t* p, size_t caplen, struct rt_stats* r
   return 0;
 }
 
+/* 802.11 header */
+struct wfb_pkt_view {
+  const struct wfb_dot11_hdr* h;
+  const uint8_t* payload;
+  size_t payload_len;
+  uint16_t seq12;
+};
+
+static int extract_dot11(const uint8_t* pkt, size_t caplen, const struct rt_stats* rs, struct wfb_pkt_view* out)
+{
+  if (rs->rt_len >= caplen) return -1;
+  const uint8_t* dot11 = pkt + rs->rt_len;
+  size_t dlen = caplen - rs->rt_len;
+  if (dlen < sizeof(struct wfb_dot11_hdr)) return -1;
+
+  const struct wfb_dot11_hdr* h = (const struct wfb_dot11_hdr*)dot11;
+  uint16_t fc = le16toh(h->frame_control);
+  uint8_t type = (fc >> 2) & 0x3;
+  uint8_t subtype = (fc >> 4) & 0xF;
+  if (type != 2) return -1; /* only Data */
+
+  size_t hdr_len = sizeof(struct wfb_dot11_hdr);
+  int qos = (subtype & 0x08) ? 1 : 0;
+  if (qos) { if (dlen < hdr_len + 2) return -1; hdr_len += 2; }
+  int order = (fc & 0x8000) ? 1 : 0;
+  if (order) { if (dlen < hdr_len + 4) return -1; hdr_len += 4; }
+
+  if (rs->flags & RADIOTAP_F_DATAPAD) {
+    size_t aligned = (hdr_len + 3u) & ~3u;
+    if (aligned > dlen) return -1;
+    hdr_len = aligned;
+  }
+
+  const uint8_t* payload = dot11 + hdr_len;
+  size_t payload_len = dlen - hdr_len;
+  if ((rs->flags & RADIOTAP_F_FCS) && payload_len >= 4) payload_len -= 4;
+  if (payload_len == 0) return -1;
+
+  out->h = h;
+  out->payload = payload;
+  out->payload_len = payload_len;
+  out->seq12 = (le16toh(h->seq_ctrl) >> 4) & 0x0FFF;
+  return 0;
+}
+
+/* CLI */
 static volatile int g_run = 1;
 static void on_sigint(int){ g_run = 0; }
 
 struct cli_cfg {
-  const char* iface;
+  int n_if;
+  const char* ifname[MAX_IFS];
   const char* ip;
   int port;
   int tx_id;
@@ -139,7 +179,7 @@ struct cli_cfg {
 static void print_help(const char* prog)
 {
   printf(
-    "Usage: sudo %s [options] <wlan_iface>\n"
+    "Usage: sudo %s [options] <wlan_iface1> [<wlan_iface2> ...]\n"
     "Options:\n"
     "  --ip <addr>         UDP destination IP (default: %s)\n"
     "  --port <num>        UDP destination port (default: %d)\n"
@@ -147,9 +187,10 @@ static void print_help(const char* prog)
     "  --link_id <id>      Filter by Link ID (addr3[4]); -1 disables filter (default: 0)\n"
     "  --radio_port <id>   Filter by Radio Port (addr3[5]); -1 disables filter (default: 0)\n"
     "  --help              Show this help and exit\n"
-    "\nExample:\n"
-    "  sudo %s --ip 127.0.0.1 --port 5600 --tx_id -1 --link_id 0 --radio_port 0 wlan0\n",
-    prog, g_dest_ip_default, g_dest_port_default, prog
+    "\nExamples:\n"
+    "  sudo %s --ip 127.0.0.1 --port 5600 --tx_id 0 --link_id 0 --radio_port 0 wlan0\n"
+    "  sudo %s --ip 127.0.0.1 --port 5600 --tx_id 0 --link_id 0 --radio_port 0 wlan0 wlan1\n",
+    prog, g_dest_ip_default, g_dest_port_default, prog, prog
   );
 }
 
@@ -160,6 +201,7 @@ static int parse_cli(int argc, char** argv, struct cli_cfg* cfg)
   cfg->tx_id = 0;       /* filters default to 0; use -1 to disable */
   cfg->link_id = 0;
   cfg->radio_port = 0;
+  cfg->n_if = 0;
 
   static struct option longopts[] = {
     {"ip",         required_argument, 0, 0},
@@ -183,44 +225,92 @@ static int parse_cli(int argc, char** argv, struct cli_cfg* cfg)
       else if (strcmp(name,"tx_id")==0)      cfg->tx_id = atoi(val);
       else if (strcmp(name,"link_id")==0)    cfg->link_id = atoi(val);
       else if (strcmp(name,"radio_port")==0) cfg->radio_port = atoi(val);
-      else if (strcmp(name,"help")==0) {
-        print_help(argv[0]);
-        exit(0);
-      }
+      else if (strcmp(name,"help")==0) { print_help(argv[0]); exit(0); }
     }
   }
   if (optind >= argc) {
-    fprintf(stderr, "Error: missing required <wlan_iface>. Use --help for usage.\n");
+    fprintf(stderr, "Error: missing <wlan_iface>. Use --help for usage.\n");
     return -1;
   }
-  cfg->iface = argv[optind];
+  for (int i=optind; i<argc && cfg->n_if < MAX_IFS; ++i) {
+    cfg->ifname[cfg->n_if++] = argv[i];
+  }
+  if (cfg->n_if == 0) {
+    fprintf(stderr, "Error: no interfaces.\n");
+    return -1;
+  }
   return 0;
 }
 
-/* Per-antenna accumulators for current stats period */
+/* Per-antenna accumulators per interface for current stats period */
 struct ant_stats {
-  uint8_t ant_id;          /* radiotap ANTENNA value (last seen) */
+  uint8_t ant_id;          /* radiotap ANTENNA (last seen) */
   int rssi_min;
   int rssi_max;
   int64_t rssi_sum;
-  uint32_t rssi_samples;   /* also counts as per-antenna received packets */
-  /* per-antenna loss tracking via 12-bit seq */
+  uint32_t rssi_samples;   /* pkts counted for this chain */
   int have_seq;
   uint16_t expect_seq;
   uint32_t lost;
 };
 
-static void ant_stats_reset(struct ant_stats* a) {
-  for (int i=0;i<RX_ANT_MAX;i++) {
-    a[i].ant_id = 0xff;
-    a[i].rssi_min = 127;
-    a[i].rssi_max = -127;
-    a[i].rssi_sum = 0;
-    a[i].rssi_samples = 0;
-    a[i].have_seq = 0;
-    a[i].expect_seq = 0;
-    a[i].lost = 0;
+static void ant_stats_reset(struct ant_stats A[MAX_IFS][RX_ANT_MAX], int n_if) {
+  for (int a=0; a<n_if; ++a)
+    for (int i=0;i<RX_ANT_MAX;i++) {
+      A[a][i].ant_id = 0xff;
+      A[a][i].rssi_min = 127;
+      A[a][i].rssi_max = -127;
+      A[a][i].rssi_sum = 0;
+      A[a][i].rssi_samples = 0;
+      A[a][i].have_seq = 0;
+      A[a][i].expect_seq = 0;
+      A[a][i].lost = 0;
+    }
+}
+
+/* Global dedup by 12-bit seq: sliding bitmap window of size 128 */
+struct seq_window {
+  uint16_t base;      /* first seq covered by bit0 */
+  uint64_t bits[2];   /* 128 bits window */
+};
+static void seqwin_init(struct seq_window* w){ w->base = 0; w->bits[0]=w->bits[1]=0; }
+
+/* compute forward distance modulo 4096 from a to b: how many steps from a to reach b (0..4095) */
+static inline uint16_t mod_fwd(uint16_t a, uint16_t b){
+  return (uint16_t)((b - a) & 0x0FFF);
+}
+
+/* test/set; returns 1 if already seen, 0 if newly set */
+static int seqwin_check_set(struct seq_window* w, uint16_t s)
+{
+  uint16_t d = mod_fwd(w->base, s);
+  if (d < 4096) {
+    if (d >= 128) {
+      /* advance window forward so that s becomes inside window at the end */
+      uint16_t shift = (uint16_t)(d - 127); /* keep s at last bit */
+      if (shift >= 128) { w->bits[0]=w->bits[1]=0; w->base = (uint16_t)((w->base + shift) & 0x0FFF); }
+      else {
+        uint64_t new0, new1;
+        if (shift >= 64) {
+          new0 = w->bits[1] >> (shift - 64);
+          new1 = 0;
+        } else {
+          new0 = (w->bits[0] >> shift) | (w->bits[1] << (64 - shift));
+          new1 = (w->bits[1] >> shift);
+        }
+        w->bits[0]=new0; w->bits[1]=new1;
+        w->base = (uint16_t)((w->base + shift) & 0x0FFF);
+      }
+      d = 127;
+    }
+    uint64_t* word = (d < 64) ? &w->bits[0] : &w->bits[1];
+    int bit = (d < 64) ? d : (d - 64);
+    uint64_t mask = (uint64_t)1 << bit;
+    int already = ((*word) & mask) ? 1 : 0;
+    *word |= mask;
+    return already;
   }
+  return 0;
 }
 
 int main(int argc, char** argv)
@@ -242,20 +332,35 @@ int main(int argc, char** argv)
     return 1;
   }
 
-  /* PCAP capture */
+  /* Open PCAP for each interface */
+  pcap_t* ph[MAX_IFS] = {0};
+  int fds[MAX_IFS]; for (int i=0;i<MAX_IFS;i++) fds[i] = -1;
+  int n_open = 0;
   char errbuf[PCAP_ERRBUF_SIZE] = {0};
-  pcap_t* ph = pcap_create(cli.iface, errbuf);
-  if (!ph) { fprintf(stderr, "pcap_create(%s): %s\n", cli.iface, errbuf); return 1; }
-  (void)pcap_set_immediate_mode(ph, 1);
-  if (pcap_activate(ph) != 0) {
-    fprintf(stderr, "pcap_activate(%s): %s\n", cli.iface, pcap_geterr(ph));
-    return 1;
+  for (int i=0;i<cli.n_if; ++i) {
+    pcap_t* p = pcap_create(cli.ifname[i], errbuf);
+    if (!p) { fprintf(stderr, "pcap_create(%s): %s\n", cli.ifname[i], errbuf); continue; }
+    (void)pcap_set_immediate_mode(p, 1);
+    (void)pcap_setnonblock(p, 1, errbuf); /* non-blocking to drain after select() */
+    if (pcap_activate(p) != 0) {
+      fprintf(stderr, "pcap_activate(%s): %s\n", cli.ifname[i], pcap_geterr(p));
+      pcap_close(p); continue;
+    }
+    int fd = pcap_get_selectable_fd(p);
+    if (fd < 0) {
+      fprintf(stderr, "pcap_get_selectable_fd(%s) failed; interface skipped\n", cli.ifname[i]);
+      pcap_close(p); continue;
+    }
+    ph[n_open]  = p;
+    fds[n_open] = fd;
+    n_open++;
   }
+  if (n_open == 0) { fprintf(stderr, "No usable interfaces opened.\n"); return 1; }
 
-  fprintf(stderr,
-          "RX: %s -> UDP %s:%d | stats %d ms | filters: TX=%d LINK=%d PORT=%d (use -1 to disable)\n",
-          cli.iface, cli.ip, cli.port, STATS_PERIOD_MS,
-          cli.tx_id, cli.link_id, cli.radio_port);
+  fprintf(stderr, "RX: ");
+  for (int i=0;i<n_open;i++) fprintf(stderr, "%s%s", cli.ifname[i], (i+1<n_open?", ":""));
+  fprintf(stderr, " -> UDP %s:%d | stats %d ms | filters: TX=%d LINK=%d PORT=%d (use -1 to disable)\n",
+          cli.ip, cli.port, STATS_PERIOD_MS, cli.tx_id, cli.link_id, cli.radio_port);
 
   /* Global period accumulators */
   uint64_t t0 = now_ms();
@@ -265,130 +370,120 @@ int main(int argc, char** argv)
   int rssi_max = -127;
   int64_t rssi_sum = 0;
   uint32_t rssi_samples = 0;
-  /* Global loss via 12-bit seq */
-  int have_seq = 0;
+  int have_seq = 0; /* kept for legacy/global loss, but dedup window handles unique acceptance */
   uint16_t expect_seq = 0;
   uint32_t lost_period = 0;
 
-  /* Per-antenna period accumulators */
-  struct ant_stats A[RX_ANT_MAX];
-  ant_stats_reset(A);
+  /* Per-antenna per-interface accumulators */
+  struct ant_stats A[MAX_IFS][RX_ANT_MAX];
+  ant_stats_reset(A, n_open);
+
+  /* Global dedup window */
+  struct seq_window W; seqwin_init(&W);
 
   while (g_run) {
-    struct pcap_pkthdr* hdr = NULL;
-    const u_char* pkt = NULL;
-    int rc = pcap_next_ex(ph, &hdr, &pkt);
-    if (rc == 0) {
-      /* periodic tick handled below */
-    } else if (rc < 0) {
-      fprintf(stderr, "pcap_next_ex: %s\n", pcap_geterr(ph));
+    /* select timeout to align with stats period */
+    uint64_t now = now_ms();
+    uint64_t ms_left = (t0 + STATS_PERIOD_MS > now) ? (t0 + STATS_PERIOD_MS - now) : 0;
+    struct timeval tv;
+    tv.tv_sec = (time_t)(ms_left / 1000);
+    tv.tv_usec = (suseconds_t)((ms_left % 1000) * 1000);
+
+    fd_set rfds; FD_ZERO(&rfds);
+    int maxfd = -1;
+    for (int i=0;i<n_open;i++) { if (fds[i]>=0) { FD_SET(fds[i], &rfds); if (fds[i] > maxfd) maxfd = fds[i]; } }
+
+    int sel = select(maxfd+1, &rfds, NULL, NULL, &tv);
+    if (sel < 0) {
+      if (errno == EINTR) goto stats_tick;
+      perror("select");
       break;
-    } else if (pkt && hdr->caplen >= sizeof(struct wfb_radiotap_hdr_min)) {
-
-      struct rt_stats rs;
-      if (parse_radiotap_rx(pkt, hdr->caplen, &rs) != 0) goto stats_tick;
-      if (rs.rt_len >= hdr->caplen) goto stats_tick;
-
-      const uint8_t* dot11 = pkt + rs.rt_len;
-      size_t dlen = hdr->caplen - rs.rt_len;
-      if (dlen < sizeof(struct wfb_dot11_hdr)) goto stats_tick;
-
-      const struct wfb_dot11_hdr* h = (const struct wfb_dot11_hdr*)dot11;
-      uint16_t fc = le16toh(h->frame_control);
-      uint8_t type = (fc >> 2) & 0x3;
-      uint8_t subtype = (fc >> 4) & 0xF;
-      if (type != 2) goto stats_tick; /* only Data */
-
-      size_t hdr_len = sizeof(struct wfb_dot11_hdr);
-      int qos = (subtype & 0x08) ? 1 : 0;
-      if (qos) { if (dlen < hdr_len + 2) goto stats_tick; hdr_len += 2; }
-      int order = (fc & 0x8000) ? 1 : 0;
-      if (order) { if (dlen < hdr_len + 4) goto stats_tick; hdr_len += 4; }
-
-      if (rs.flags & RADIOTAP_F_DATAPAD) {
-        size_t aligned = (hdr_len + 3u) & ~3u;
-        if (aligned > dlen) goto stats_tick;
-        hdr_len = aligned;
-      }
-
-      const uint8_t* payload = dot11 + hdr_len;
-      size_t payload_len = dlen - hdr_len;
-      if ((rs.flags & RADIOTAP_F_FCS) && payload_len >= 4) payload_len -= 4;
-      if (payload_len == 0) goto stats_tick;
-
-      /* Address-based filters (defaults active; -1 disables) */
-      uint8_t tx_id      = h->addr2[5];
-      uint8_t link_id    = h->addr3[4];
-      uint8_t radio_port = h->addr3[5];
-      if (cli.tx_id      >= 0 && tx_id      != (uint8_t)cli.tx_id)      goto stats_tick;
-      if (cli.link_id    >= 0 && link_id    != (uint8_t)cli.link_id)    goto stats_tick;
-      if (cli.radio_port >= 0 && radio_port != (uint8_t)cli.radio_port) goto stats_tick;
-
-      /* Global sequence / loss */
-      uint16_t seq = (le16toh(h->seq_ctrl) >> 4) & 0x0FFF;
-      if (!have_seq) {
-        have_seq = 1;
-        expect_seq = (uint16_t)((seq + 1) & 0x0FFF);
-      } else {
-        if (seq != expect_seq) {
-          uint16_t gap = (uint16_t)((seq - expect_seq) & 0x0FFF);
-          lost_period += gap;
-          expect_seq = (uint16_t)((seq + 1) & 0x0FFF);
-        } else {
-          expect_seq = (uint16_t)((expect_seq + 1) & 0x0FFF);
-        }
-      }
-
-      /* Per-antenna sequence/loss + RSSI accumulation:
-       * If a chain reports RSSI for this frame, we treat it as "received" for that chain.
-       * Loss per chain is computed vs its own last seen seq (12-bit).
-       */
-      for (int i=0;i<rs.chains && i<RX_ANT_MAX; ++i) {
-        if (rs.rssi[i] == SCHAR_MIN) continue; /* chain absent in this frame */
-        if (!A[i].have_seq) {
-          A[i].have_seq = 1;
-          A[i].expect_seq = (uint16_t)((seq + 1) & 0x0FFF);
-        } else {
-          if (seq != A[i].expect_seq) {
-            uint16_t gap = (uint16_t)((seq - A[i].expect_seq) & 0x0FFF);
-            A[i].lost += gap;
-            A[i].expect_seq = (uint16_t)((seq + 1) & 0x0FFF);
-          } else {
-            A[i].expect_seq = (uint16_t)((A[i].expect_seq + 1) & 0x0FFF);
-          }
-        }
-        /* RSSI stats for this chain */
-        int r = rs.rssi[i];
-        if (r < A[i].rssi_min) A[i].rssi_min = r;
-        if (r > A[i].rssi_max) A[i].rssi_max = r;
-        A[i].rssi_sum += r;
-        A[i].rssi_samples++;
-        A[i].ant_id = rs.antenna[i];
-      }
-
-      /* Global per-packet RSSI = best chain */
-      int pkt_rssi_valid = 0;
-      int pkt_rssi = -127;
-      for (int i=0;i<rs.chains && i<RX_ANT_MAX; ++i) {
-        if (rs.rssi[i] != SCHAR_MIN) {
-          pkt_rssi_valid = 1;
-          if (rs.rssi[i] > pkt_rssi) pkt_rssi = rs.rssi[i];
-        }
-      }
-      if (pkt_rssi_valid) {
-        if (pkt_rssi < rssi_min) rssi_min = pkt_rssi;
-        if (pkt_rssi > rssi_max) rssi_max = pkt_rssi;
-        rssi_sum += pkt_rssi;
-        rssi_samples++;
-      }
-
-      /* Forward payload to UDP destination */
-      (void)sendto(us, payload, payload_len, 0, (struct sockaddr*)&dst, sizeof(dst));
-
-      /* Global accumulators */
-      rx_pkts_period += 1;
-      bytes_period   += payload_len;
     }
+
+    for (int i=0;i<n_open;i++) {
+      if (fds[i] < 0) continue;
+      if (sel == 0 || !FD_ISSET(fds[i], &rfds)) continue;
+
+      /* drain all available packets for this handle (non-blocking) */
+      while (1) {
+        struct pcap_pkthdr* hdr = NULL;
+        const u_char* pkt = NULL;
+        int rc = pcap_next_ex(ph[i], &hdr, &pkt);
+        if (rc <= 0) break; /* 0=no pkt; -1/-2 error/eof */
+
+        struct rt_stats rs;
+        if (parse_radiotap_rx(pkt, hdr->caplen, &rs) != 0) continue;
+
+        struct wfb_pkt_view v;
+        if (extract_dot11(pkt, hdr->caplen, &rs, &v) != 0) continue;
+
+        /* filters */
+        uint8_t tx_id      = v.h->addr2[5];
+        uint8_t link_id    = v.h->addr3[4];
+        uint8_t radio_port = v.h->addr3[5];
+        if (cli.tx_id      >= 0 && tx_id      != (uint8_t)cli.tx_id)      continue;
+        if (cli.link_id    >= 0 && link_id    != (uint8_t)cli.link_id)    continue;
+        if (cli.radio_port >= 0 && radio_port != (uint8_t)cli.radio_port) continue;
+
+        /* dedup: accept only first time we see this seq inside window */
+        int dup = seqwin_check_set(&W, v.seq12);
+        if (dup) {
+          /* still update per-interface/antenna seq tracking & RSSI for diagnostics */
+        } else {
+          /* global loss tracking (approx): treat gaps vs expect_seq */
+          if (!have_seq) { have_seq = 1; expect_seq = (uint16_t)((v.seq12 + 1) & 0x0FFF); }
+          else {
+            if (v.seq12 != expect_seq) {
+              uint16_t gap = (uint16_t)((v.seq12 - expect_seq) & 0x0FFF);
+              lost_period += gap;
+              expect_seq = (uint16_t)((v.seq12 + 1) & 0x0FFF);
+            } else {
+              expect_seq = (uint16_t)((expect_seq + 1) & 0x0FFF);
+            }
+          }
+
+          /* global per-packet RSSI = best chain */
+          int pkt_rssi_valid = 0;
+          int pkt_rssi = -127;
+          for (int c=0;c<rs.chains && c<RX_ANT_MAX; ++c) {
+            if (rs.rssi[c] != SCHAR_MIN) { pkt_rssi_valid = 1; if (rs.rssi[c] > pkt_rssi) pkt_rssi = rs.rssi[c]; }
+          }
+          if (pkt_rssi_valid) {
+            if (pkt_rssi < rssi_min) rssi_min = pkt_rssi;
+            if (pkt_rssi > rssi_max) rssi_max = pkt_rssi;
+            rssi_sum += pkt_rssi;
+            rssi_samples++;
+          }
+
+          /* forward once */
+          (void)sendto(us, v.payload, v.payload_len, 0, (struct sockaddr*)&dst, sizeof(dst));
+          rx_pkts_period += 1;
+          bytes_period   += v.payload_len;
+        }
+
+        /* per-antenna per-interface sequence & RSSI (count only when chain reports RSSI) */
+        for (int c=0;c<rs.chains && c<RX_ANT_MAX; ++c) {
+          if (rs.rssi[c] == SCHAR_MIN) continue;
+          struct ant_stats* S = &A[i][c];
+          if (!S->have_seq) { S->have_seq = 1; S->expect_seq = (uint16_t)((v.seq12 + 1) & 0x0FFF); }
+          else {
+            if (v.seq12 != S->expect_seq) {
+              uint16_t gap = (uint16_t)((v.seq12 - S->expect_seq) & 0x0FFF);
+              S->lost += gap;
+              S->expect_seq = (uint16_t)((v.seq12 + 1) & 0x0FFF);
+            } else {
+              S->expect_seq = (uint16_t)((S->expect_seq + 1) & 0x0FFF);
+            }
+          }
+          int r = rs.rssi[c];
+          if (r < S->rssi_min) S->rssi_min = r;
+          if (r > S->rssi_max) S->rssi_max = r;
+          S->rssi_sum += r;
+          S->rssi_samples++;
+          S->ant_id = rs.antenna[c];
+        }
+      } /* drain */
+    } /* each iface */
 
 stats_tick:
     uint64_t t1 = now_ms();
@@ -400,25 +495,25 @@ stats_tick:
       double rssi_avg = (rssi_samples > 0) ? ((double)rssi_sum / (double)rssi_samples) : 0.0;
       if (rssi_samples == 0) { rssi_min = 0; rssi_max = 0; }
 
-      /* Print global stats */
       fprintf(stderr,
         "[STATS] dt=%llu ms | pkts=%u lost=%u quality=%d%% | bytes=%llu rate=%.1f kbps | RSSI best-chain min/avg/max = %d/%.1f/%d dBm\n",
         (unsigned long long)(t1 - t0), rx_pkts_period, lost_period, quality,
         (unsigned long long)bytes_period, kbps,
         rssi_min, rssi_avg, rssi_max);
 
-      /* Print per-antenna stats */
-      for (int i=0;i<RX_ANT_MAX; ++i) {
-        if (A[i].rssi_samples == 0 && A[i].lost == 0) continue; /* silent chain in this window */
-        uint32_t exp_i = A[i].rssi_samples + A[i].lost;
-        int qual_i = exp_i ? (int)((A[i].rssi_samples * 100.0) / exp_i + 0.5) : 100;
-        double avg_i = (A[i].rssi_samples > 0) ? ((double)A[i].rssi_sum / (double)A[i].rssi_samples) : 0.0;
-        int min_i = (A[i].rssi_samples > 0) ? A[i].rssi_min : 0;
-        int max_i = (A[i].rssi_samples > 0) ? A[i].rssi_max : 0;
-        fprintf(stderr,
-          "   [ANT%u] id=%u pkts=%u lost=%u quality=%d%% | rssi min/avg/max = %d/%.1f/%d dBm\n",
-          i, (unsigned)(A[i].ant_id==0xff? i : A[i].ant_id),
-          A[i].rssi_samples, A[i].lost, qual_i, min_i, avg_i, max_i);
+      for (int a=0; a<n_open; ++a) {
+        for (int c=0; c<RX_ANT_MAX; ++c) {
+          const struct ant_stats* S = &A[a][c];
+          if (S->rssi_samples == 0 && S->lost == 0) continue;
+          uint32_t exp_i = S->rssi_samples + S->lost;
+          int qual_i = exp_i ? (int)((S->rssi_samples * 100.0) / exp_i + 0.5) : 100;
+          double avg_i = (S->rssi_samples > 0) ? ((double)S->rssi_sum / (double)S->rssi_samples) : 0.0;
+          int min_i = (S->rssi_samples > 0) ? S->rssi_min : 0;
+          int max_i = (S->rssi_samples > 0) ? S->rssi_max : 0;
+          /* ANT label: ANTabc : a=iface idx, bc=chain idx two digits */
+          fprintf(stderr, "   [ANT%1d%02d] pkts=%u lost=%u quality=%d%% | rssi min/avg/max = %d/%.1f/%d dBm\n",
+                  a, c, S->rssi_samples, S->lost, qual_i, min_i, avg_i, max_i);
+        }
       }
 
       /* reset period */
@@ -427,11 +522,11 @@ stats_tick:
       rx_pkts_period = 0;
       lost_period = 0;
       rssi_min = 127; rssi_max = -127; rssi_sum = 0; rssi_samples = 0;
-      ant_stats_reset(A);
+      ant_stats_reset(A, n_open);
     }
   }
 
-  if (ph) pcap_close(ph);
+  for (int i=0;i<n_open;i++) if (ph[i]) pcap_close(ph[i]);
   close(us);
   return 0;
 }
