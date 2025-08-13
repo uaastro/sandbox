@@ -2,8 +2,8 @@
 // - Supports multiple WLAN interfaces (positional args): receive diversity
 // - A frame is accepted if received on at least one interface (dedup by 12-bit seq)
 // - Per-antenna stats labeled ANTabc: a=iface index, bc=antenna index (00..99)
-// - CLI: --ip, --port, --tx_id, --link_id, --radio_port, --help
-// - Periodic stats (STATS_PERIOD_MS, default 1000 ms):
+// - CLI: --ip, --port, --tx_id, --link_id, --radio_port, --stat_period, --help
+// - Periodic stats (default 1000 ms or --stat_period):
 //     Global: packets, bytes, kbps, lost, quality, RSSI(best-chain) min/avg/max
 //     Per-antenna (per interface): pkts, lost, quality, RSSI min/avg/max
 
@@ -40,13 +40,12 @@
 
 #include "wfb_defs.h"
 
-/* ---- Config ---- */
-#ifndef STATS_PERIOD_MS
-#define STATS_PERIOD_MS 1000
+/* ---- Defaults ---- */
+#ifndef STATS_PERIOD_MS_DEFAULT
+#define STATS_PERIOD_MS_DEFAULT 1000
 #endif
 #define MAX_IFS 8
 
-/* Defaults */
 static const char* g_dest_ip_default   = "127.0.0.1";
 static const int   g_dest_port_default = 5600;
 
@@ -117,7 +116,7 @@ static int parse_radiotap_rx(const uint8_t* p, size_t caplen, struct rt_stats* r
   return 0;
 }
 
-/* 802.11 header */
+/* 802.11 header view */
 struct wfb_pkt_view {
   const struct wfb_dot11_hdr* h;
   const uint8_t* payload;
@@ -174,6 +173,7 @@ struct cli_cfg {
   int tx_id;
   int link_id;
   int radio_port;
+  int stat_period_ms; /* NEW: stats period */
 };
 
 static void print_help(const char* prog)
@@ -186,11 +186,12 @@ static void print_help(const char* prog)
     "  --tx_id <id>        Filter by TX ID (addr2[5]); -1 disables filter (default: 0)\n"
     "  --link_id <id>      Filter by Link ID (addr3[4]); -1 disables filter (default: 0)\n"
     "  --radio_port <id>   Filter by Radio Port (addr3[5]); -1 disables filter (default: 0)\n"
+    "  --stat_period <ms>  Stats period in milliseconds (default: %d)\n"
     "  --help              Show this help and exit\n"
     "\nExamples:\n"
-    "  sudo %s --ip 127.0.0.1 --port 5600 --tx_id 0 --link_id 0 --radio_port 0 wlan0\n"
-    "  sudo %s --ip 127.0.0.1 --port 5600 --tx_id 0 --link_id 0 --radio_port 0 wlan0 wlan1\n",
-    prog, g_dest_ip_default, g_dest_port_default, prog, prog
+    "  sudo %s --ip 127.0.0.1 --port 5600 --tx_id 0 --link_id 0 --radio_port 0 --stat_period 500 wlan0\n"
+    "  sudo %s --stat_period 2000 wlan0 wlan1\n",
+    prog, g_dest_ip_default, g_dest_port_default, STATS_PERIOD_MS_DEFAULT, prog, prog
   );
 }
 
@@ -202,14 +203,16 @@ static int parse_cli(int argc, char** argv, struct cli_cfg* cfg)
   cfg->link_id = 0;
   cfg->radio_port = 0;
   cfg->n_if = 0;
+  cfg->stat_period_ms = STATS_PERIOD_MS_DEFAULT;
 
   static struct option longopts[] = {
-    {"ip",         required_argument, 0, 0},
-    {"port",       required_argument, 0, 0},
-    {"tx_id",      required_argument, 0, 0},
-    {"link_id",    required_argument, 0, 0},
-    {"radio_port", required_argument, 0, 0},
-    {"help",       no_argument,       0, 0},
+    {"ip",           required_argument, 0, 0},
+    {"port",         required_argument, 0, 0},
+    {"tx_id",        required_argument, 0, 0},
+    {"link_id",      required_argument, 0, 0},
+    {"radio_port",   required_argument, 0, 0},
+    {"stat_period",  required_argument, 0, 0},
+    {"help",         no_argument,       0, 0},
     {0,0,0,0}
   };
 
@@ -220,11 +223,12 @@ static int parse_cli(int argc, char** argv, struct cli_cfg* cfg)
     if (c == 0) {
       const char* name = longopts[optidx].name;
       const char* val  = optarg ? optarg : "";
-      if      (strcmp(name,"ip")==0)         cfg->ip = val;
-      else if (strcmp(name,"port")==0)       cfg->port = atoi(val);
-      else if (strcmp(name,"tx_id")==0)      cfg->tx_id = atoi(val);
-      else if (strcmp(name,"link_id")==0)    cfg->link_id = atoi(val);
-      else if (strcmp(name,"radio_port")==0) cfg->radio_port = atoi(val);
+      if      (strcmp(name,"ip")==0)           cfg->ip = val;
+      else if (strcmp(name,"port")==0)         cfg->port = atoi(val);
+      else if (strcmp(name,"tx_id")==0)        cfg->tx_id = atoi(val);
+      else if (strcmp(name,"link_id")==0)      cfg->link_id = atoi(val);
+      else if (strcmp(name,"radio_port")==0)   cfg->radio_port = atoi(val);
+      else if (strcmp(name,"stat_period")==0)  cfg->stat_period_ms = atoi(val);
       else if (strcmp(name,"help")==0) { print_help(argv[0]); exit(0); }
     }
   }
@@ -239,6 +243,7 @@ static int parse_cli(int argc, char** argv, struct cli_cfg* cfg)
     fprintf(stderr, "Error: no interfaces.\n");
     return -1;
   }
+  if (cfg->stat_period_ms <= 0) cfg->stat_period_ms = STATS_PERIOD_MS_DEFAULT;
   return 0;
 }
 
@@ -274,30 +279,19 @@ struct seq_window {
   uint64_t bits[2];   /* 128 bits window */
 };
 static void seqwin_init(struct seq_window* w){ w->base = 0; w->bits[0]=w->bits[1]=0; }
-
-/* compute forward distance modulo 4096 from a to b: how many steps from a to reach b (0..4095) */
-static inline uint16_t mod_fwd(uint16_t a, uint16_t b){
-  return (uint16_t)((b - a) & 0x0FFF);
-}
-
+static inline uint16_t mod_fwd(uint16_t a, uint16_t b){ return (uint16_t)((b - a) & 0x0FFF); }
 /* test/set; returns 1 if already seen, 0 if newly set */
 static int seqwin_check_set(struct seq_window* w, uint16_t s)
 {
   uint16_t d = mod_fwd(w->base, s);
   if (d < 4096) {
     if (d >= 128) {
-      /* advance window forward so that s becomes inside window at the end */
       uint16_t shift = (uint16_t)(d - 127); /* keep s at last bit */
       if (shift >= 128) { w->bits[0]=w->bits[1]=0; w->base = (uint16_t)((w->base + shift) & 0x0FFF); }
       else {
         uint64_t new0, new1;
-        if (shift >= 64) {
-          new0 = w->bits[1] >> (shift - 64);
-          new1 = 0;
-        } else {
-          new0 = (w->bits[0] >> shift) | (w->bits[1] << (64 - shift));
-          new1 = (w->bits[1] >> shift);
-        }
+        if (shift >= 64) { new0 = w->bits[1] >> (shift - 64); new1 = 0; }
+        else { new0 = (w->bits[0] >> shift) | (w->bits[1] << (64 - shift)); new1 = (w->bits[1] >> shift); }
         w->bits[0]=new0; w->bits[1]=new1;
         w->base = (uint16_t)((w->base + shift) & 0x0FFF);
       }
@@ -360,7 +354,7 @@ int main(int argc, char** argv)
   fprintf(stderr, "RX: ");
   for (int i=0;i<n_open;i++) fprintf(stderr, "%s%s", cli.ifname[i], (i+1<n_open?", ":""));
   fprintf(stderr, " -> UDP %s:%d | stats %d ms | filters: TX=%d LINK=%d PORT=%d (use -1 to disable)\n",
-          cli.ip, cli.port, STATS_PERIOD_MS, cli.tx_id, cli.link_id, cli.radio_port);
+          cli.ip, cli.port, cli.stat_period_ms, cli.tx_id, cli.link_id, cli.radio_port);
 
   /* Global period accumulators */
   uint64_t t0 = now_ms();
@@ -384,7 +378,7 @@ int main(int argc, char** argv)
   while (g_run) {
     /* select timeout to align with stats period */
     uint64_t now = now_ms();
-    uint64_t ms_left = (t0 + STATS_PERIOD_MS > now) ? (t0 + STATS_PERIOD_MS - now) : 0;
+    uint64_t ms_left = (t0 + (uint64_t)cli.stat_period_ms > now) ? (t0 + (uint64_t)cli.stat_period_ms - now) : 0;
     struct timeval tv;
     tv.tv_sec = (time_t)(ms_left / 1000);
     tv.tv_usec = (suseconds_t)((ms_left % 1000) * 1000);
@@ -487,7 +481,7 @@ int main(int argc, char** argv)
 
 stats_tick:
     uint64_t t1 = now_ms();
-    if (t1 - t0 >= (uint64_t)STATS_PERIOD_MS) {
+    if (t1 - t0 >= (uint64_t)cli.stat_period_ms) {
       double seconds = (double)(t1 - t0) / 1000.0;
       double kbps = seconds > 0.0 ? (bytes_period * 8.0 / 1000.0) / seconds : 0.0;
       uint32_t expected = rx_pkts_period + lost_period;
@@ -510,7 +504,6 @@ stats_tick:
           double avg_i = (S->rssi_samples > 0) ? ((double)S->rssi_sum / (double)S->rssi_samples) : 0.0;
           int min_i = (S->rssi_samples > 0) ? S->rssi_min : 0;
           int max_i = (S->rssi_samples > 0) ? S->rssi_max : 0;
-          /* ANT label: ANTabc : a=iface idx, bc=chain idx two digits */
           fprintf(stderr, "   [ANT%1d%02d] pkts=%u lost=%u quality=%d%% | rssi min/avg/max = %d/%.1f/%d dBm\n",
                   a, c, S->rssi_samples, S->lost, qual_i, min_i, avg_i, max_i);
         }
