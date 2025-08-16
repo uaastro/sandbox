@@ -3,6 +3,7 @@
 // - A frame is accepted if received on at least one interface (dedup by 12-bit seq)
 // - Per-antenna stats labeled ANTabc: a=iface index, bc=antenna index (00..99)
 // - CLI: --ip, --port, --tx_id, --link_id, --radio_port, --stat_period, --help
+// - TX filter supports: "any"/-1 (accept all), include-list "1,2,5,10-12", exclude-list "!3,7,20-25"
 // - Periodic stats (default 1000 ms or --stat_period):
 //     Global: packets, bytes, kbps, lost, quality, RSSI(best-chain) min/avg/max
 //     Per-antenna (per interface): pkts, lost, quality, RSSI min/avg/max
@@ -21,6 +22,7 @@
 #include <unistd.h>
 #include <time.h>
 #include <limits.h>
+#include <ctype.h>
 
 #ifdef __linux__
   #include <endian.h>
@@ -161,7 +163,87 @@ static int extract_dot11(const uint8_t* pkt, size_t caplen, const struct rt_stat
   return 0;
 }
 
-/* CLI */
+/* ---- TX-ID FILTER ------------------------------------------------------- */
+
+enum { TXF_ANY = 0, TXF_INCLUDE = 1, TXF_EXCLUDE = 2 };
+
+struct txid_filter {
+  int mode;          /* TXF_ANY / TXF_INCLUDE / TXF_EXCLUDE */
+  uint64_t map[4];   /* 256-bit bitmap of IDs */
+};
+
+static void txf_set(struct txid_filter* f, unsigned v) {
+  if (v > 255) return;
+  f->map[v >> 6] |= (uint64_t)1ull << (v & 63);
+}
+static int txf_test(const struct txid_filter* f, unsigned v) {
+  if (v > 255) return 0;
+  return (f->map[v >> 6] >> (v & 63)) & 1ull;
+}
+static void txf_clear_all(struct txid_filter* f) { f->map[0]=f->map[1]=f->map[2]=f->map[3]=0; }
+//static void txf_init_any(struct txid_filter* f)  { f->mode = TXF_ANY; txf_clear_all(f); }
+
+static int parse_uint(const char* s, unsigned* out) {
+  char* end = NULL;
+  long v = strtol(s, &end, 0);
+  if (!s || s==end || v < 0 || v > 255) return -1;
+  *out = (unsigned)v;
+  return 0;
+}
+
+/* Parse spec: "any" | "-1" | list | "!list", where list = "n[,m][,a-b]..." */
+static int txf_parse(struct txid_filter* f, const char* spec)
+{
+  txf_clear_all(f);
+  if (!spec || !*spec) { f->mode = TXF_INCLUDE; txf_set(f, 0); return 0; } /* default to {0} */
+
+  while (isspace((unsigned char)*spec)) ++spec;
+
+  if (strcmp(spec, "any") == 0 || strcmp(spec, "-1") == 0) {
+    f->mode = TXF_ANY; return 0;
+  }
+
+  int excl = 0;
+  if (spec[0] == '!') { excl = 1; ++spec; }
+
+  f->mode = excl ? TXF_EXCLUDE : TXF_INCLUDE;
+
+  char buf[256];
+  strncpy(buf, spec, sizeof(buf)-1); buf[sizeof(buf)-1] = 0;
+
+  char* saveptr = NULL;
+  char* tok = strtok_r(buf, ",", &saveptr);
+  while (tok) {
+    while (isspace((unsigned char)*tok)) ++tok;
+    /* range a-b? */
+    char* dash = strchr(tok, '-');
+    if (dash) {
+      *dash = 0;
+      const char* sA = tok;
+      const char* sB = dash+1;
+      unsigned a,b;
+      if (parse_uint(sA, &a)==0 && parse_uint(sB, &b)==0) {
+        if (a<=b) { for (unsigned v=a; v<=b; ++v) txf_set(f, v); }
+        else      { for (unsigned v=b; v<=a; ++v) txf_set(f, v); }
+      }
+    } else {
+      unsigned v;
+      if (parse_uint(tok, &v)==0) txf_set(f, v);
+    }
+    tok = strtok_r(NULL, ",", &saveptr);
+  }
+  return 0;
+}
+
+static int txf_match(const struct txid_filter* f, uint8_t tx)
+{
+  if (f->mode == TXF_ANY) return 1;
+  int present = txf_test(f, tx);
+  return (f->mode == TXF_INCLUDE) ? present : !present;
+}
+
+/* ---- CLI ---------------------------------------------------------------- */
+
 static volatile int g_run = 1;
 static void on_sigint(int){ g_run = 0; }
 
@@ -170,10 +252,10 @@ struct cli_cfg {
   const char* ifname[MAX_IFS];
   const char* ip;
   int port;
-  int tx_id;
+  struct txid_filter txf; /* NEW: flexible filter */
   int link_id;
   int radio_port;
-  int stat_period_ms; /* NEW: stats period */
+  int stat_period_ms;
 };
 
 static void print_help(const char* prog)
@@ -183,15 +265,22 @@ static void print_help(const char* prog)
     "Options:\n"
     "  --ip <addr>         UDP destination IP (default: %s)\n"
     "  --port <num>        UDP destination port (default: %d)\n"
-    "  --tx_id <id>        Filter by TX ID (addr2[5]); -1 disables filter (default: 0)\n"
+    "  --tx_id <spec>      Filter by transmitter IDs:\n"
+    "                     'any' or '-1'               → accept all\n"
+    "                      include list '1,2,5,10-12' → accept only listed IDs\n"
+    "                      exclude list '!3,7,20-25   → accept all except listed IDs'\n"
+    "                      (NOTE: use quotes or escape '!' in bash: --tx_id '!0,7' or --tx_id '\'!0,7)\n" 
+    "                      (default: 0 — only tx_id=0)\n"
     "  --link_id <id>      Filter by Link ID (addr3[4]); -1 disables filter (default: 0)\n"
     "  --radio_port <id>   Filter by Radio Port (addr3[5]); -1 disables filter (default: 0)\n"
     "  --stat_period <ms>  Stats period in milliseconds (default: %d)\n"
     "  --help              Show this help and exit\n"
     "\nExamples:\n"
-    "  sudo %s --ip 127.0.0.1 --port 5600 --tx_id 0 --link_id 0 --radio_port 0 --stat_period 500 wlan0\n"
-    "  sudo %s --stat_period 2000 wlan0 wlan1\n",
-    prog, g_dest_ip_default, g_dest_port_default, STATS_PERIOD_MS_DEFAULT, prog, prog
+    "  sudo %s --tx_id any wlan0\n"
+    "  sudo %s --tx_id 1,2,10-12 wlan0 wlan1\n"
+    "  sudo %s --tx_id !3,7,20-25 --link_id 0 --radio_port 0 wlan0\n",
+    prog, g_dest_ip_default, g_dest_port_default, STATS_PERIOD_MS_DEFAULT,
+    prog, prog, prog
   );
 }
 
@@ -199,7 +288,7 @@ static int parse_cli(int argc, char** argv, struct cli_cfg* cfg)
 {
   cfg->ip = g_dest_ip_default;
   cfg->port = g_dest_port_default;
-  cfg->tx_id = 0;       /* filters default to 0; use -1 to disable */
+  txf_parse(&cfg->txf, "0");   /* default: only tx_id=0 */
   cfg->link_id = 0;
   cfg->radio_port = 0;
   cfg->n_if = 0;
@@ -225,7 +314,7 @@ static int parse_cli(int argc, char** argv, struct cli_cfg* cfg)
       const char* val  = optarg ? optarg : "";
       if      (strcmp(name,"ip")==0)           cfg->ip = val;
       else if (strcmp(name,"port")==0)         cfg->port = atoi(val);
-      else if (strcmp(name,"tx_id")==0)        cfg->tx_id = atoi(val);
+      else if (strcmp(name,"tx_id")==0)        txf_parse(&cfg->txf, val);
       else if (strcmp(name,"link_id")==0)      cfg->link_id = atoi(val);
       else if (strcmp(name,"radio_port")==0)   cfg->radio_port = atoi(val);
       else if (strcmp(name,"stat_period")==0)  cfg->stat_period_ms = atoi(val);
@@ -286,7 +375,7 @@ static int seqwin_check_set(struct seq_window* w, uint16_t s)
   uint16_t d = mod_fwd(w->base, s);
   if (d < 4096) {
     if (d >= 128) {
-      uint16_t shift = (uint16_t)(d - 127); /* keep s at last bit */
+      uint16_t shift = (uint16_t)(d - 127);
       if (shift >= 128) { w->bits[0]=w->bits[1]=0; w->base = (uint16_t)((w->base + shift) & 0x0FFF); }
       else {
         uint64_t new0, new1;
@@ -335,7 +424,7 @@ int main(int argc, char** argv)
     pcap_t* p = pcap_create(cli.ifname[i], errbuf);
     if (!p) { fprintf(stderr, "pcap_create(%s): %s\n", cli.ifname[i], errbuf); continue; }
     (void)pcap_set_immediate_mode(p, 1);
-    (void)pcap_setnonblock(p, 1, errbuf); /* non-blocking to drain after select() */
+    (void)pcap_setnonblock(p, 1, errbuf);
     if (pcap_activate(p) != 0) {
       fprintf(stderr, "pcap_activate(%s): %s\n", cli.ifname[i], pcap_geterr(p));
       pcap_close(p); continue;
@@ -353,8 +442,10 @@ int main(int argc, char** argv)
 
   fprintf(stderr, "RX: ");
   for (int i=0;i<n_open;i++) fprintf(stderr, "%s%s", cli.ifname[i], (i+1<n_open?", ":""));
-  fprintf(stderr, " -> UDP %s:%d | stats %d ms | filters: TX=%d LINK=%d PORT=%d (use -1 to disable)\n",
-          cli.ip, cli.port, cli.stat_period_ms, cli.tx_id, cli.link_id, cli.radio_port);
+  fprintf(stderr, " -> UDP %s:%d | stats %d ms | filters: TX=%s LINK=%d PORT=%d\n",
+          cli.ip, cli.port, cli.stat_period_ms,
+          (cli.txf.mode==TXF_ANY?"any":(cli.txf.mode==TXF_INCLUDE?"include":"exclude")),
+          cli.link_id, cli.radio_port);
 
   /* Global period accumulators */
   uint64_t t0 = now_ms();
@@ -364,7 +455,7 @@ int main(int argc, char** argv)
   int rssi_max = -127;
   int64_t rssi_sum = 0;
   uint32_t rssi_samples = 0;
-  int have_seq = 0; /* kept for legacy/global loss, but dedup window handles unique acceptance */
+  int have_seq = 0;
   uint16_t expect_seq = 0;
   uint32_t lost_period = 0;
 
@@ -376,7 +467,6 @@ int main(int argc, char** argv)
   struct seq_window W; seqwin_init(&W);
 
   while (g_run) {
-    /* select timeout to align with stats period */
     uint64_t now = now_ms();
     uint64_t ms_left = (t0 + (uint64_t)cli.stat_period_ms > now) ? (t0 + (uint64_t)cli.stat_period_ms - now) : 0;
     struct timeval tv;
@@ -398,12 +488,11 @@ int main(int argc, char** argv)
       if (fds[i] < 0) continue;
       if (sel == 0 || !FD_ISSET(fds[i], &rfds)) continue;
 
-      /* drain all available packets for this handle (non-blocking) */
       while (1) {
         struct pcap_pkthdr* hdr = NULL;
         const u_char* pkt = NULL;
         int rc = pcap_next_ex(ph[i], &hdr, &pkt);
-        if (rc <= 0) break; /* 0=no pkt; -1/-2 error/eof */
+        if (rc <= 0) break;
 
         struct rt_stats rs;
         if (parse_radiotap_rx(pkt, hdr->caplen, &rs) != 0) continue;
@@ -415,16 +504,13 @@ int main(int argc, char** argv)
         uint8_t tx_id      = v.h->addr2[5];
         uint8_t link_id    = v.h->addr3[4];
         uint8_t radio_port = v.h->addr3[5];
-        if (cli.tx_id      >= 0 && tx_id      != (uint8_t)cli.tx_id)      continue;
+        if (!txf_match(&cli.txf, tx_id)) continue;
         if (cli.link_id    >= 0 && link_id    != (uint8_t)cli.link_id)    continue;
         if (cli.radio_port >= 0 && radio_port != (uint8_t)cli.radio_port) continue;
 
-        /* dedup: accept only first time we see this seq inside window */
+        /* dedup by seq */
         int dup = seqwin_check_set(&W, v.seq12);
-        if (dup) {
-          /* still update per-interface/antenna seq tracking & RSSI for diagnostics */
-        } else {
-          /* global loss tracking (approx): treat gaps vs expect_seq */
+        if (!dup) {
           if (!have_seq) { have_seq = 1; expect_seq = (uint16_t)((v.seq12 + 1) & 0x0FFF); }
           else {
             if (v.seq12 != expect_seq) {
@@ -435,7 +521,6 @@ int main(int argc, char** argv)
               expect_seq = (uint16_t)((expect_seq + 1) & 0x0FFF);
             }
           }
-
           /* global per-packet RSSI = best chain */
           int pkt_rssi_valid = 0;
           int pkt_rssi = -127;
@@ -448,14 +533,13 @@ int main(int argc, char** argv)
             rssi_sum += pkt_rssi;
             rssi_samples++;
           }
-
           /* forward once */
           (void)sendto(us, v.payload, v.payload_len, 0, (struct sockaddr*)&dst, sizeof(dst));
           rx_pkts_period += 1;
           bytes_period   += v.payload_len;
         }
 
-        /* per-antenna per-interface sequence & RSSI (count only when chain reports RSSI) */
+        /* per-antenna per-interface stats */
         for (int c=0;c<rs.chains && c<RX_ANT_MAX; ++c) {
           if (rs.rssi[c] == SCHAR_MIN) continue;
           struct ant_stats* S = &A[i][c];

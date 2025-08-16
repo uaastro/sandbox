@@ -124,3 +124,66 @@ static inline size_t wfb_rt_size(uint8_t field_idx) {
 #define WFB_TXF_NOAGG      0x0080
 #define WFB_TXF_FIXED_RATE 0x0100
 #endif
+
+/* ---------- Radiotap MCS + TX definitions ---------- */
+
+/* TX flags */
+#ifndef IEEE80211_RADIOTAP_F_TX_NOACK
+#define IEEE80211_RADIOTAP_F_TX_NOACK      0x0008
+#endif
+#ifndef IEEE80211_RADIOTAP_F_TX_NOSEQ
+#define IEEE80211_RADIOTAP_F_TX_NOSEQ      0x0010
+#endif
+#ifndef IEEE80211_RADIOTAP_F_TX_FIXED_RATE
+#define IEEE80211_RADIOTAP_F_TX_FIXED_RATE 0x0100
+#endif
+
+/* MCS known bits */
+#ifndef IEEE80211_RADIOTAP_MCS_HAVE_MCS
+#define IEEE80211_RADIOTAP_MCS_HAVE_MCS    0x02
+#endif
+#ifndef IEEE80211_RADIOTAP_MCS_HAVE_BW
+#define IEEE80211_RADIOTAP_MCS_HAVE_BW     0x01
+#endif
+#ifndef IEEE80211_RADIOTAP_MCS_HAVE_GI
+#define IEEE80211_RADIOTAP_MCS_HAVE_GI     0x04
+#endif
+#ifndef IEEE80211_RADIOTAP_MCS_HAVE_FEC
+#define IEEE80211_RADIOTAP_MCS_HAVE_FEC    0x10
+#endif
+#ifndef IEEE80211_RADIOTAP_MCS_HAVE_STBC
+#define IEEE80211_RADIOTAP_MCS_HAVE_STBC   0x20
+#endif
+
+/* MCS flags */
+#ifndef IEEE80211_RADIOTAP_MCS_BW_20
+#define IEEE80211_RADIOTAP_MCS_BW_20       0
+#endif
+#ifndef IEEE80211_RADIOTAP_MCS_BW_40
+#define IEEE80211_RADIOTAP_MCS_BW_40       1
+#endif
+#ifndef IEEE80211_RADIOTAP_MCS_SGI
+#define IEEE80211_RADIOTAP_MCS_SGI         0x04
+#endif
+#ifndef IEEE80211_RADIOTAP_MCS_FEC_LDPC
+#define IEEE80211_RADIOTAP_MCS_FEC_LDPC    0x10
+#endif
+#ifndef IEEE80211_RADIOTAP_MCS_STBC_MASK
+#define IEEE80211_RADIOTAP_MCS_STBC_MASK   0x60
+#endif
+
+/* Radiotap TX header */
+struct wfb_radiotap_tx {
+  uint8_t  it_version;
+  uint8_t  it_pad;
+  uint16_t it_len;
+  uint32_t it_present;
+
+  uint16_t tx_flags; /* IEEE80211_RADIOTAP_TX_FLAGS */
+
+  struct {
+    uint8_t known;
+    uint8_t flags;
+    uint8_t mcs;
+  } mcs; /* IEEE80211_RADIOTAP_MCS */
+} __attribute__((packed));
